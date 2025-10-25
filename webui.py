@@ -36,7 +36,7 @@ full_auto_interface = gr.Interface(
         gr.Slider(minimum=0, maximum=10, step=1, label="Number of shifts", value=5, visible=False),
 
         # ASR — add Higgs path
-        gr.Dropdown(["Whisper", "FunASR", "Higgs"], label="ASR backend", value="Higgs"),
+        gr.Dropdown(["Higgs", "WhisperX", "FunASR"], label="ASR backend", value="Higgs"),
         gr.Radio(["large", "medium", "small", "base", "tiny"], label="WhisperX size", value="large", visible=False),
         gr.Slider(minimum=1, maximum=128, step=1, label="Batch size", value=32, visible=False),
         gr.Checkbox(label="Enable speaker diarization", value=True, visible=False),
@@ -53,25 +53,25 @@ full_auto_interface = gr.Interface(
         ),
         # UPDATED target-language choices for translation (kept default)
         gr.Dropdown(
-            ["Simplified Chinese", "Traditional Chinese", "English", "Japanese", "Korean", "Spanish", "Tamil", "Cantonese"],
-            label="Subtitle language",
-            value="Simplified Chinese",
+        ["Simplified Chinese (简体中文)", "Traditional Chinese (繁体中文)", "English", "Korean", "Spanish"],
+        label="Subtitle language",
+        value="Simplified Chinese (简体中文)",
         ),
 
         # TTS — keep the 3 supported methods in your router
-        gr.Dropdown(["xtts", "cosyvoice", "EdgeTTS", "Higgs"], label="TTS method", value="Higgs"),
+        gr.Dropdown(["Higgs", "xtts", "cosyvoice", "EdgeTTS"], label="TTS method", value="Higgs"),
         # UPDATED TTS target-language choices (deduped; Tamil shown but works best with EdgeTTS)
         gr.Dropdown(
-            ["Chinese", "English", "Japanese", "Korean", "Spanish", "French", "Cantonese"],
+            ["Chinese (中文)", "English", "Korean", "Spanish", "French"],
             label="TTS target language",
-            value="Chinese",
+            value="Chinese (中文)",
         ),
         gr.Dropdown(SUPPORT_VOICE, value="zh-CN-XiaoxiaoNeural", label="EdgeTTS voice", visible=False),
 
         gr.Checkbox(label="Subtitles", value=True),
         gr.Slider(minimum=0.5, maximum=2, step=0.05, label="Playback speed", value=1.00, visible=False),
         gr.Slider(minimum=1, maximum=60, step=1, label="FPS", value=30, visible=False),
-        gr.Audio(label="Background music", sources=["upload"], visible=False),
+        gr.Audio(label="Background music", sources=["upload"], type="filepath", visible=False),
         gr.Slider(minimum=0, maximum=1, step=0.05, label="BGM volume", value=0.5, visible=False),
         gr.Slider(minimum=0, maximum=1, step=0.05, label="Video volume", value=1.0, visible=False),
         gr.Radio(

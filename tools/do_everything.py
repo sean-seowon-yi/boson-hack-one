@@ -1,8 +1,10 @@
+# tools/do_everything.py
 import json
 import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import torch
 from loguru import logger
@@ -33,6 +35,37 @@ models_initialized = {
     # Higgs ASR is API-based; kept out of init gating intentionally
 }
 
+# === UI → internal normalization (keep EXACTLY these UI labels) ===
+_UI_TO_TRANSLATION_LANG = {
+    "Simplified Chinese (简体中文)": "简体中文",
+    "Traditional Chinese (繁体中文)": "繁体中文",
+    "English": "English",
+    "Korean": "Korean",
+    "Spanish": "Spanish",
+}
+
+# For TTS, your dropdown is: ["Chinese (中文)", "English", "Korean", "Spanish", "French"]
+_UI_TO_TTS_LANG = {
+    "Chinese (中文)": "中文",
+    "English": "English",
+    "Korean": "Korean",
+    "Spanish": "Spanish",
+    "French": "French",
+}
+
+def _norm_translation_lang(ui_label: str) -> str:
+    return _UI_TO_TRANSLATION_LANG.get(ui_label, ui_label)
+
+def _norm_tts_lang(ui_label: str) -> str:
+    return _UI_TO_TTS_LANG.get(ui_label, ui_label)
+
+def _coerce_int_or_none(x):
+    if x in (None, "", "None"):
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
 
 def get_available_gpu_memory() -> float:
     """Return available GPU memory in GiB (0 if CUDA is unavailable or an error occurs)."""
@@ -75,6 +108,9 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
                     futures.append(executor.submit(init_cosyvoice))
                     models_initialized["cosyvoice"] = True
                     logger.info("Initialized CosyVoice")
+            elif tts_method == "Higgs":
+                # API-based; nothing to init locally
+                logger.info("TTS 'Higgs' selected — API-based")
 
             # ASR (local initializers when applicable)
             if asr_method == "WhisperX":
@@ -92,7 +128,7 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
                     models_initialized["funasr"] = True
                     logger.info("Initialized FunASR")
             elif asr_method == "Higgs":
-                # Higgs ASR is an API call to Boson; no local model to init
+                # API-based; no local model to init
                 logger.info("ASR 'Higgs' selected — API-based, no local initialization required")
 
             # Ensure any init exception gets raised here
@@ -165,7 +201,14 @@ def process_video(
                 progress_callback(progress_base, stage_name)
 
             if isinstance(info, str) and info.endswith(".mp4"):
-                folder = os.path.dirname(info)
+                # Local file mode: place it under <root_folder>/<basename>/download.mp4
+                import shutil
+                original_file_name = os.path.basename(info)
+                folder_name = os.path.splitext(original_file_name)[0]
+                folder = os.path.join(root_folder, folder_name)
+                os.makedirs(folder, exist_ok=True)
+                dest_path = os.path.join(folder, "download.mp4")
+                shutil.copy(info, dest_path)
             else:
                 folder = get_target_folder(info, root_folder)
                 if folder is None:
@@ -207,15 +250,19 @@ def process_video(
                 progress_callback(progress_base, stage_name)
 
             try:
+                # Coerce radios to int/None if needed
+                whisper_min_speakers_c = _coerce_int_or_none(whisper_min_speakers)
+                whisper_max_speakers_c = _coerce_int_or_none(whisper_max_speakers)
+
                 status, result_json = transcribe_all_audio_under_folder(
                     folder,
                     asr_method=asr_method,
-                    whisper_model_name=whisper_model,  # ignored by Higgs path inside step020_asr if implemented that way
+                    whisper_model_name=whisper_model,  # ignored by Higgs path if implemented that way
                     device=device,
                     batch_size=batch_size,
                     diarization=diarization,
-                    min_speakers=whisper_min_speakers,
-                    max_speakers=whisper_max_speakers,
+                    min_speakers=whisper_min_speakers_c,
+                    max_speakers=whisper_max_speakers_c,
                 )
                 logger.info(f"ASR completed: {status}")
             except Exception as e:
@@ -232,10 +279,12 @@ def process_video(
                 progress_callback(progress_base, stage_name)
 
             try:
-                status, summary, translation = translate_all_transcript_under_folder(
+                # Normalize translation language label
+                translation_target_language = _norm_translation_lang(translation_target_language)
+                msg, summary, translation = translate_all_transcript_under_folder(
                     folder, method=translation_method, target_language=translation_target_language
                 )
-                logger.info(f"Translation completed: {status}")
+                logger.info(f"Translation completed: {msg}")
             except Exception as e:
                 stack_trace = traceback.format_exc()
                 error_msg = f"Translation failed: {e}\n{stack_trace}"
@@ -250,6 +299,8 @@ def process_video(
                 progress_callback(progress_base, stage_name)
 
             try:
+                # Normalize TTS language label
+                tts_target_language = _norm_tts_lang(tts_target_language)
                 status, synth_path, _ = generate_all_wavs_under_folder(
                     folder, method=tts_method, target_language=tts_target_language, voice=voice
                 )
@@ -311,16 +362,16 @@ def do_everything(
     demucs_model="htdemucs_ft",
     device="auto",
     shifts=5,
-    asr_method="WhisperX",  # can be "WhisperX", "FunASR", or "Higgs"
+    asr_method="Higgs",          # <-- matches your UI default
     whisper_model="large",
     batch_size=32,
     diarization=False,
     whisper_min_speakers=None,
     whisper_max_speakers=None,
     translation_method="LLM",
-    translation_target_language="Simplified Chinese",
-    tts_method="xtts",
-    tts_target_language="Chinese",
+    translation_target_language="Simplified Chinese (简体中文)",  # <-- exact UI label
+    tts_method="Higgs",          # <-- matches your UI default
+    tts_target_language="Chinese (中文)",                         # <-- exact UI label
     voice="zh-CN-XiaoxiaoNeural",
     subtitles=True,
     speed_up=1.00,
@@ -355,7 +406,7 @@ def do_everything(
         logger.info("-" * 50)
 
         # Normalize multiline URL list; allow comma/Chinese comma separators
-        normalized = url.replace(" ", "").replace("，", "\n").replace(",", "\n")
+        normalized = (url or "").replace(" ", "").replace("，", "\n").replace(",", "\n")
         urls = [u for u in normalized.split("\n") if u]
 
         # Warm up models once
@@ -368,26 +419,13 @@ def do_everything(
             logger.error(f"Model initialization failed: {e}\n{stack_trace}")
             return f"Model initialization failed: {e}", None
 
-        out_video = None
+        out_video: Optional[str] = None
 
-        # Local file mode (path endswith .mp4)
+        # Local file convenience: handle a single .mp4 path
         if url.endswith(".mp4"):
             try:
-                import shutil
-
-                original_file_name = os.path.basename(url)
-                folder_name = os.path.splitext(original_file_name)[0]
-                target_folder = os.path.join(root_folder, folder_name)
-                os.makedirs(target_folder, exist_ok=True)
-
-                source_path = os.path.join(root_folder, original_file_name)
-                dest_path = os.path.join(target_folder, "download.mp4")
-
-                # Copy (not move) to avoid destroying the source; keeps previous behavior intent
-                shutil.copy(source_path, dest_path)
-
                 success, output_video, error_msg = process_video(
-                    dest_path,
+                    url,  # pass the actual file path
                     root_folder,
                     resolution,
                     demucs_model,
@@ -416,10 +454,10 @@ def do_everything(
                 )
 
                 if success:
-                    logger.info(f"Local video processed successfully: {dest_path}")
+                    logger.info(f"Local video processed successfully: {url}")
                     return "Success", output_video
                 else:
-                    logger.error(f"Local video failed: {dest_path}, error: {error_msg}")
+                    logger.error(f"Local video failed: {url}, error: {error_msg}")
                     return f"Failed: {error_msg}", None
 
             except Exception as e:
@@ -511,13 +549,3 @@ def do_everything(
         error_msg = f"Pipeline error: {e}\n{stack_trace}"
         logger.error(error_msg)
         return error_msg, None
-
-
-if __name__ == "__main__":
-    do_everything(
-        root_folder="videos",
-        url="https://www.bilibili.com/video/BV1kr421M7vz/",
-        translation_method="LLM",
-        # Example:
-        # translation_method="Google Translate", translation_target_language="Simplified Chinese",
-    )

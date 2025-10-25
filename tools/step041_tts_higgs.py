@@ -1,765 +1,463 @@
 # -*- coding: utf-8 -*-
 """
-Boson Hackathon TTS (multilingual, native-like, consistent) — enhanced + audio hotfix
-- OpenAI-compatible Higgs Audio Generation
-- Multilingual verbatim: EN / KO / ZH / ES / TA (extensible)
-- Language lock + anti code-switch
-- Clean timbre extraction from speaker_wav (2s best-voice segment)
-- Anchor-conditioning for consistent voice/tone/pitch across chunks
-- Previous-chunk prosody context (not read aloud)
-- Parallel chunks (after anchor), crossfaded joins, loudness normalize, soft limiter
-- Low-variance decoding (deterministic by default)
-- HTTP/2 pooling if httpx is available
-- Optional minimal SSML pauses via TTS_USE_SSML=1 (OFF by default)
-- Optional few-shot anti-translation via TTS_USE_FEWSHOT=1 (OFF by default)
-- Forces WAV output from server; validates WAV header; emergency gain for near-silence
-- .env-configurable; drop-in signature: tts(text, output_path, speaker_wav, voice_type=None)
+step041_tts_higgs.py
+Higgs/Boson TTS — OpenAI-compatible, robust + fast (Boson chat schema)
+
+Env (.env):
+  BOSON_API_KEY=...
+  BOSON_BASE_URL=https://hackathon.boson.ai/v1
+  HIGGS_TTS_MODEL=higgs-audio-generation-Hackathon
+  Optional:
+    HIGGS_TTS_SPEED=1.0              # hint only; server may ignore
+    HIGGS_TTS_MAX_WORKERS=4
+    HIGGS_TTS_CHUNK_CHARS=280
+    HIGGS_TTS_RETRIES=3
+    HIGGS_TTS_BACKOFF=0.6
+    HIGGS_TTS_XFADE_MS=28
+    HIGGS_TTS_STREAM=0              # set to 1 to enable streaming PCM16
+
+Public API (matches dispatcher):
+    init_TTS()
+    load_model()
+    tts(text, output_path, speaker_wav, **kwargs)
 """
 
-import os
-import io
-import re
-import time
-import math
-import base64
-import unicodedata
-import hashlib
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from __future__ import annotations
+import os, io, re, time, base64, random
+from functools import lru_cache
+from typing import Optional, Tuple, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
 from dotenv import load_dotenv
 from loguru import logger
 from openai import OpenAI
 
-import numpy as np
-import soundfile as sf
-
-# Optional httpx for HTTP/2 connection pooling
 try:
-    import httpx
-    _HAS_HTTPX = True
+    from .utils import save_wav as project_save_wav
 except Exception:
-    _HAS_HTTPX = False
+    project_save_wav = None
 
-# Optional g2p (silent fallback if missing)
 try:
-    from pypinyin import pinyin, Style  # Mandarin tone hints (optional)
-    _HAS_PYPINYIN = True
+    import soundfile as sf
 except Exception:
-    _HAS_PYPINYIN = False
+    sf = None
 
-# -----------------------------
-# Environment & client helpers
-# -----------------------------
-load_dotenv()
+SR = 24000
+EPS = 1e-8
 
-def _load_boson_cfg():
-    """
-    Load required + optional settings from .env.
-    Required: BOSON_API_KEY, BOSON_BASE_URL, HIGGS_TTS_MODEL
-    Optional: TTS_WORKERS, TTS_TARGET_SR, TTS_CHUNK_CHARS, TTS_MAX_RETRIES,
-              TTS_TIMEOUT_S, TTS_SPEED, TTS_LANG_OVERRIDE, TTS_REF_*, TTS_STYLE_*,
-              TTS_USE_SSML, TTS_USE_FEWSHOT, TTS_DEBUG_SAVE_FIRST
-    """
-    cfg = {
-        # required
-        "api_key":  os.getenv("BOSON_API_KEY"),
-        "base_url": os.getenv("BOSON_BASE_URL", "https://hackathon.boson.ai/v1"),
-        "model":    os.getenv("HIGGS_TTS_MODEL"),
+# ------------------------------------------------------------------------------
+# WAV helpers
+def _save_wav_fallback(wav: np.ndarray, path: str, sr: int = SR) -> None:
+    if sf is None:
+        raise RuntimeError("soundfile is required: pip install soundfile")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    sf.write(path, wav.astype(np.float32), sr)
 
-        # optional (provide safe defaults)
-        "workers":      int(os.getenv("TTS_WORKERS", "6")),
-        "target_sr":    int(os.getenv("TTS_TARGET_SR", "24000")),
-        "chunk_chars":  int(os.getenv("TTS_CHUNK_CHARS", "200")),
-        "max_retries":  int(os.getenv("TTS_MAX_RETRIES", "2")),
-        "timeout_s":    float(os.getenv("TTS_TIMEOUT_S", "45")),
-        "speed_ratio":  float(os.getenv("TTS_SPEED", "1.00")),
-        "use_ssml":     (os.getenv("TTS_USE_SSML", "0") == "1"),         # OFF by default
-        "use_fewshot":  (os.getenv("TTS_USE_FEWSHOT", "0") == "1"),      # OFF by default
-        "debug_save":   (os.getenv("TTS_DEBUG_SAVE_FIRST", "0") == "1"), # OFF by default
-
-        # OPTIONAL language override; empty string means “no override”
-        "lang_override": (os.getenv("TTS_LANG_OVERRIDE") or "").strip().lower(),
-    }
-
-    missing = [k for k in ("api_key", "base_url", "model") if not cfg[k]]
-    if missing:
-        raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
-
-    return cfg
-
-_client = None
-_model = None
-_cfg = None
-
-def _get_client_and_model():
-    global _client, _model, _cfg
-    if _client is None or _model is None or _cfg is None:
-        _cfg = _load_boson_cfg()
-
-        http_client = None
-        if _HAS_HTTPX:
-            try:
-                limits = httpx.Limits(max_keepalive_connections=24, max_connections=48)
-                http_client = httpx.Client(http2=True, timeout=_cfg["timeout_s"], limits=limits)
-            except Exception as e:
-                logger.warning(f"[Higgs TTS] httpx client init failed; falling back: {e}")
-                http_client = None
-
-        try:
-            _client = OpenAI(
-                api_key=_cfg["api_key"],
-                base_url=_cfg["base_url"],
-                http_client=http_client  # newer OpenAI SDKs accept this; ignored otherwise
-            )
-        except TypeError:
-            _client = OpenAI(api_key=_cfg["api_key"], base_url=_cfg["base_url"])
-
-        _model = _cfg["model"]
-        logger.info(f"[Higgs TTS] Client initialized @ {_cfg['base_url']} | model={_model}")
-    return _client, _model, _cfg
-
-def _b64_file(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-# -----------------------------
-# Language detection & splitting
-# -----------------------------
-_SCRIPT_PAT = {
-    "zh": re.compile(r"[\u4e00-\u9fff]"),
-    "ko": re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]"),
-    "ta": re.compile(r"[\u0B80-\u0BFF]"),
-    "es": re.compile(r"[¿¡ñáéíóúÁÉÍÓÚ]"),
-}
-
-_LANG_NAME_NATIVE = {
-    "en": "English",
-    "zh": "中文（普通话）",
-    "ko": "한국어",
-    "es": "Español",
-    "ta": "தமிழ்",
-}
-
-def _detect_lang(txt: str, override: str | None = None) -> str:
-    if override in {"en", "zh", "ko", "es", "ta"}:
-        return override
-    for code, pat in _SCRIPT_PAT.items():
-        if pat.search(txt):
-            return code
-    return "en"
-
-_SENT_SEP = {
-    "zh": r"(?<=[。！？…])\s+",
-    "ko": r"(?<=[\.!?…])\s+",
-    "es": r"(?<=[\.\!\?…])\s+",
-    "ta": r"(?<=[\.!?…])\s+",
-    "en": r"(?<=[\.\!\?…])\s+",
-}
-
-def _normalize_text(txt: str) -> str:
-    txt = unicodedata.normalize("NFC", txt)
-    txt = re.sub(r"\s+", " ", txt).strip()
-    if txt and txt[-1] not in ".!?。！？…":
-        txt += "."
-    return txt
-
-def _inject_soft_breaks(text: str, lang: str) -> str:
-    """
-    Insert subtle, language-appropriate soft breaks to improve rhythm,
-    without altering words or translating. Keeps characters intact.
-    """
-    t = text.strip()
-    t = re.sub(r"\s+", " ", t)
-    t = t.replace("...", "…")
-
-    if lang in {"zh"}:
-        # Add a slight list-break '、' in very long runs without punctuation
-        out, run = [], 0
-        for ch in t:
-            out.append(ch)
-            if ch in "，。！？；：、…":
-                run = 0
-            else:
-                run += 1
-                if run >= 18:
-                    out.append("、")
-                    run = 0
-        t = "".join(out)
+def save_wav(wav: np.ndarray, path: str, sr: int = SR) -> None:
+    if project_save_wav:
+        project_save_wav(wav, path, sr)
     else:
-        # Ensure a single space after commas for tiny pause
-        t = re.sub(r",\s*", ", ", t)
-        # Assist very long sentences with mild spacing
-        if len(t) > 100:
-            t = re.sub(r"(\w{16,})(\s+)", r"\1 \2", t)
-    return t
+        _save_wav_fallback(wav, path, sr)
 
-def _split_sentences(txt: str, lang: str, max_chars: int):
-    sep = _SENT_SEP.get(lang, _SENT_SEP["en"])
-    raw = [s.strip() for s in re.split(sep, txt) if s.strip()]
-    if not raw:
+# ------------------------------------------------------------------------------
+# Environment / config
+load_dotenv()
+_BOSON_BASE_URL = (os.getenv("BOSON_BASE_URL") or "https://hackathon.boson.ai/v1").strip()
+_BOSON_API_KEY  = (os.getenv("BOSON_API_KEY")  or "").strip()
+_DEFAULT_MODEL  = (os.getenv("HIGGS_TTS_MODEL") or "higgs-audio-generation-Hackathon").strip()
+_DEF_SPEED      = float(os.getenv("HIGGS_TTS_SPEED") or 1.0)   # hint only
+_DEF_WORKERS    = max(1, int(os.getenv("HIGGS_TTS_MAX_WORKERS") or 4))
+_DEF_CHARS      = max(120, int(os.getenv("HIGGS_TTS_CHUNK_CHARS") or 280))
+_DEF_RETRIES    = max(1, int(os.getenv("HIGGS_TTS_RETRIES") or 3))
+_DEF_BACKOFF    = float(os.getenv("HIGGS_TTS_BACKOFF") or 0.6)
+_DEF_XF_MS      = int(os.getenv("HIGGS_TTS_XFADE_MS") or 28)
+_USE_STREAM     = bool(int(os.getenv("HIGGS_TTS_STREAM", "0")))  # opt-in
+
+_client: Optional[OpenAI] = None
+_initialized = False
+
+def init_TTS():
+    load_model()
+
+def load_model(model_path: Optional[str] = None, device: str = 'auto'):
+    """Initialize OpenAI-compatible Higgs client (lazy singleton)."""
+    global _client, _initialized
+    if _initialized:
+        return
+    if not _BOSON_BASE_URL or not _BOSON_API_KEY:
+        raise RuntimeError("Missing BOSON_BASE_URL or BOSON_API_KEY in .env")
+    _client = OpenAI(base_url=_BOSON_BASE_URL, api_key=_BOSON_API_KEY)
+    _initialized = True
+    logger.info(f"[Higgs TTS] Connected to Boson/Higgs API @ {_BOSON_BASE_URL}")
+
+# ------------------------------------------------------------------------------
+# Language mapping
+_language_map = {
+    '中文': 'zh-cn', 'Chinese': 'zh-cn',
+    'Korean': 'ko', '한국어': 'ko',
+    'English': 'en',
+    'Japanese': 'ja', '日本語': 'ja',
+    'Tamil': 'ta', 'தமிழ்': 'ta',
+    'Spanish': 'es', 'Español': 'es',
+}
+_LANG_NATIVE = {
+    'zh-cn': 'Mandarin Chinese',
+    'ko':    'Korean',
+    'en':    'English',
+    'ja':    'Japanese',
+    'ta':    'Tamil',
+    'es':    'Spanish',
+}
+_SUPPORTED = set(_language_map.values())
+
+# Precompiled unicode ranges for fast detection
+_RE_CJK   = re.compile(r'[\u4e00-\u9fff]')
+_RE_HANG  = re.compile(r'[\uac00-\ud7af]')
+_RE_KANA  = re.compile(r'[\u3040-\u30ff]')
+_RE_TAMIL = re.compile(r'[\u0b80-\u0bff]')
+
+@lru_cache(maxsize=1024)
+def _map_lang(label: str) -> str:
+    return _language_map.get(label, label).lower().strip()
+
+def _guess_lang(text: str) -> str:
+    """Fast language detection (CJK / Hangul / Kana / Tamil / else English)."""
+    if _RE_CJK.search(text):   return 'zh-cn'
+    if _RE_HANG.search(text):  return 'ko'
+    if _RE_KANA.search(text):  return 'ja'
+    if _RE_TAMIL.search(text): return 'ta'
+    return 'en'
+
+# ------------------------------------------------------------------------------
+# System prompt for language lock
+def _system_prompt(lang_code: str) -> str:
+    native = _LANG_NATIVE.get(lang_code, "target language")
+    return (
+        f"Speak ONLY in {native} (code: {lang_code}). "
+        "Read the user text verbatim with native pronunciation and prosody. "
+        "Do NOT translate or paraphrase. Do NOT switch languages. "
+        "If the input contains other-language words, read them using the target language phonotactics; "
+        "do not output in another language. Never read bracketed hints aloud. "
+        "Timing rules: treat commas as ~120ms pauses and sentence endings as ~220ms pauses. "
+        "Avoid adding filler sounds or breaths. Keep a steady pace; do not elongate vowels unless written. "
+        "Read numerals as written; do not expand or abbreviate."
+    )
+
+# ------------------------------------------------------------------------------
+# Text split helpers (CJK-aware budgets)
+_SENT_SPLIT = re.compile(r'(?<=[。！？!?…．\.，,；;：:])\s+|[\n\r]+')
+
+def _split_text(text: str, chunk_chars: int, lang_code: str) -> List[str]:
+    text = (text or "").strip()
+    if not text:
         return []
+    budget = int(chunk_chars * (0.75 if lang_code in ("zh-cn", "ja", "ko") else 1.0))
 
-    # Language-aware budget: characters are denser in CJK; permit larger chunks safely.
-    budget = max_chars
-    if lang in {"zh", "ko", "ta"}:
-        budget = int(max_chars * 1.8)
-    elif lang in {"es"}:
-        budget = int(max_chars * 1.3)
-
-    chunks, cur = [], ""
-    for s in raw:
+    parts = re.split(_SENT_SPLIT, text)
+    out, cur = [], ""
+    for raw in parts:
+        s = raw.strip()
+        if not s:
+            continue
         if not cur:
             cur = s
         elif len(cur) + 1 + len(s) <= budget:
             cur = f"{cur} {s}"
         else:
-            chunks.append(cur)
+            out.append(cur)
             cur = s
     if cur:
-        chunks.append(cur)
+        out.append(cur)
+    if len(out) >= 2 and len(out[-1]) < max(8, budget // 4):
+        out[-2] = f"{out[-2]} {out[-1]}"; out.pop()
+    return out
 
-    # Merge stragglers: avoid final tiny pieces
-    if len(chunks) >= 2 and len(chunks[-1]) < budget // 3:
-        chunks[-2] = f"{chunks[-2]} {chunks[-1]}".strip()
-        chunks.pop()
+# ------------------------------------------------------------------------------
+# Audio utilities
+def _loudness_normalize(wav: np.ndarray, target_rms: float = 0.08) -> np.ndarray:
+    if wav.size == 0:
+        return wav
+    rms = float(np.sqrt(np.mean(np.square(wav))) + EPS)
+    gain = target_rms / rms
+    return np.clip(wav * gain, -1.0, 1.0)
 
-    return chunks
-
-# -----------------------------
-# Optional native refs & style
-# -----------------------------
-def _load_lang_refs_from_env():
-    env_map = {
-        "en": os.getenv("TTS_REF_EN"),
-        "zh": os.getenv("TTS_REF_ZH"),
-        "ko": os.getenv("TTS_REF_KO"),
-        "es": os.getenv("TTS_REF_ES"),
-        "ta": os.getenv("TTS_REF_TA"),
-    }
-    ref_audio = {}
-    for lang, path in env_map.items():
-        if path and os.path.exists(path):
-            try:
-                with open(path, "rb") as f:
-                    ref_audio[lang] = base64.b64encode(f.read()).decode("utf-8")
-            except Exception as e:
-                logger.warning(f"[Higgs TTS] Failed loading native ref {lang}: {e}")
-    return ref_audio
-
-def _style_note(lang: str) -> str:
-    fallback = {
-        "en": "Neutral North American narration, clear articulation.",
-        "zh": "普通话（中国大陆），自然停顿，保持地道声调与轻重缓急。",
-        "ko": "표준 발음, 자연스러운 억양, 문장 끝을 부드럽게 처리.",
-        "es": "Español latino neutro, ritmo natural, entonación clara y fluida.",
-        "ta": "நெறிப்படுத்தப்பட்ட தமிழ் உச்சரிப்பு, இயல்பான தாளம் மற்றும் இடைவெளிகள்.",
-    }
-    env_key = {
-        "en": "TTS_STYLE_EN", "zh": "TTS_STYLE_ZH", "ko": "TTS_STYLE_KO",
-        "es": "TTS_STYLE_ES", "ta": "TTS_STYLE_TA"
-    }.get(lang)
-    return os.getenv(env_key) or fallback.get(lang, "")
-
-def _make_zh_tone_hint(text: str) -> str:
-    if not _HAS_PYPINYIN:
-        return ""
-    snippet = re.sub(r"\s+", "", text)[:30]
-    if not snippet:
-        return ""
-    py = pinyin(snippet, style=Style.TONE3, strict=False)
-    py_str = " ".join(s[0] for s in py if s and s[0])
-    return f"【内注音提示（请勿朗读）: {py_str}】"
-
-# -----------------------------
-# DSP helpers
-# -----------------------------
-def _rms(y: np.ndarray) -> float:
-    if y.size == 0:
-        return 0.0
-    y = y.astype(np.float32, copy=False)
-    return float(np.sqrt(np.mean(np.maximum(y * y, 1e-12))))
-
-def _loudness_normalize(y: np.ndarray, target_dbfs: float = -16.0) -> np.ndarray:
-    if y.size == 0:
-        return y
-    y = y.astype(np.float32, copy=False)
-    rms = _rms(y)
-    cur_dbfs = 20.0 * math.log10(max(rms, 1e-9))
-    gain = 10.0 ** ((target_dbfs - cur_dbfs) / 20.0)
-    y = y * gain
-    thr = 10 ** (-1.0 / 20.0)  # -1 dBFS
-    y = np.tanh(y / thr) * thr
-    return y.astype(np.float32, copy=False)
-
-def _concat_with_crossfade(y_list: list[np.ndarray], sr: int, xf_ms: int = 30) -> np.ndarray:
-    if not y_list:
+def _concat_xfade(chunks: List[np.ndarray], sr: int = SR, xf_ms: int = _DEF_XF_MS) -> np.ndarray:
+    if not chunks:
         return np.zeros(0, dtype=np.float32)
-    if len(y_list) == 1:
-        return y_list[0].astype(np.float32, copy=False)
+    if len(chunks) == 1:
+        return chunks[0].astype(np.float32, copy=False)
     xf = max(1, int(sr * xf_ms / 1000.0))
-    out = y_list[0].astype(np.float32, copy=True)
-    for seg in y_list[1:]:
+    out = chunks[0].astype(np.float32, copy=True)
+    for seg in chunks[1:]:
         if seg is None or seg.size == 0:
             continue
         seg = seg.astype(np.float32, copy=False)
-        a_len = min(out.size, xf)
-        b_len = min(seg.size, xf)
-        n = min(a_len, b_len)
+        n = min(xf, out.size, seg.size)
         if n > 0:
-            fade_out = np.linspace(1.0, 0.0, n, dtype=np.float32)
-            fade_in  = 1.0 - fade_out
-            mixed = out[-n:] * fade_out + seg[:n] * fade_in
-            out = np.concatenate([out[:-n], mixed, seg[n:]]).astype(np.float32, copy=False)
+            fade = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            mix = out[-n:] * (1.0 - fade) + seg[:n] * fade
+            out = np.concatenate([out[:-n], mix, seg[n:]], dtype=np.float32)
         else:
-            out = np.concatenate([out, seg]).astype(np.float32, copy=False)
+            out = np.concatenate([out, seg], dtype=np.float32)
     return out
 
-def _resample_linear(y: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
-    if sr_from == sr_to or y.size == 0:
-        return y.astype(np.float32, copy=False)
-    ratio = sr_to / sr_from
-    x_old = np.linspace(0.0, 1.0, num=y.size, endpoint=False, dtype=np.float64)
-    x_new = np.linspace(0.0, 1.0, num=int(round(y.size * ratio)), endpoint=False, dtype=np.float64)
-    y_new = np.interp(x_new, x_old, y.astype(np.float64)).astype(np.float32)
-    return y_new
-
-# --- Clean reference selection (best ~2s voiced segment) ---
-def _frame_energy(x: np.ndarray, win: int = 1024, hop: int = 256) -> np.ndarray:
-    if x.size < win:
-        return np.array([float(np.mean(x * x))], dtype=np.float32)
-    n = 1 + (x.size - win) // hop
-    E = np.empty(n, dtype=np.float32)
-    for i in range(n):
-        seg = x[i*hop:i*hop+win]
-        E[i] = float(np.mean(seg * seg))
-    return E
-
-def _select_clean_ref_segment(path: str, target_sr: int = 24000,
-                              seg_seconds: float = 2.0) -> np.ndarray | None:
-    """Return the cleanest ~2s mono segment from `path` or None on failure."""
+# ------------------------------------------------------------------------------
+# Chat extractor (Boson schema)
+def _extract_b64_from_chat(resp) -> Optional[str]:
+    # Preferred: choices[0].message.audio.data
     try:
-        y, sr = sf.read(path, always_2d=False, dtype="float32")
-        if isinstance(y, np.ndarray) and y.ndim == 2:
-            y = y.mean(axis=1)
-        if sr != target_sr and y.size:
-            y = _resample_linear(y, sr, target_sr)
-        y = y.astype(np.float32, copy=False)
-
-        if y.size < int(0.6 * target_sr):
-            return y if y.size else None
-
-        win, hop = 1024, 256
-        E = _frame_energy(y, win, hop)
-        if E.size < 8:
-            seg = y[: int(seg_seconds * target_sr)]
-        else:
-            clip_mask = (np.abs(y) > 0.98).astype(np.float32)
-            if clip_mask.any():
-                clip_frames = np.convolve(clip_mask, np.ones(win, dtype=np.float32), mode="valid")[::hop]
-                clip_frames = clip_frames[:E.size]
-                E = E / (1.0 + 5.0 * clip_frames)
-            best_i = int(np.argmax(E))
-            center_samp = best_i * hop + win // 2
-            half = int(seg_seconds * target_sr // 2)
-            start = max(0, center_samp - half)
-            end = min(y.size, start + int(seg_seconds * target_sr))
-            seg = y[start:end]
-
-        nfade = min(256, seg.size // 8)
-        if nfade > 0:
-            seg[:nfade] *= np.linspace(0.2, 1.0, nfade, dtype=np.float32)
-            seg[-nfade:] *= np.linspace(1.0, 0.2, nfade, dtype=np.float32)
-        return seg
-    except Exception:
-        return None
-
-# -----------------------------
-# Audio extraction / decoding (WAV forced)
-# -----------------------------
-def _extract_audio_b64(resp) -> str:
-    # Primary: OpenAI-style audio field
-    try:
-        return resp.choices[0].message.audio.data
+        data = resp.choices[0].message.audio.data
+        if data:
+            return data
     except Exception:
         pass
-    # Secondary: content list with output_audio / audio dicts
+    # Fallback: content list blocks
     try:
         content = resp.choices[0].message.content
         if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict):
-                    if item.get("type") == "output_audio" and "audio" in item and "data" in item["audio"]:
-                        return item["audio"]["data"]
-                    if "audio" in item and "data" in item["audio"]:
-                        return item["audio"]["data"]
-                    if item.get("type") == "audio" and "data" in item:
-                        return item["data"]
+            for it in content:
+                if isinstance(it, dict):
+                    # output_audio style
+                    if it.get("type") in ("output_audio", "audio"):
+                        aud = it.get("audio") or it
+                        data = aud.get("data")
+                        if data:
+                            return data
     except Exception:
         pass
-    raise ValueError("No audio base64 found in response")
+    return None
 
-def _read_wav_bytes(raw: bytes):
-    # Guard: make sure this looks like WAV (RIFF/WAVE)
-    if not (len(raw) > 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"):
-        raise ValueError("Returned audio is not WAV. Ensure audio.format='wav' is requested.")
-    data, sr = sf.read(io.BytesIO(raw), always_2d=False, dtype="float32")
-    if isinstance(data, np.ndarray) and data.ndim == 2:
-        data = data.mean(axis=1).astype(np.float32)
-    y = data.astype(np.float32, copy=False)
+# ------------------------------------------------------------------------------
+# Core synthesis (non-streaming, WAV in base64 inside chat response)
+def _synthesize_once(
+    text: str,
+    language: str,
+    ref_b64: Optional[str],
+    model_name: str,
+    speed: float,
+) -> np.ndarray:
+    assert _client is not None, "Call init_TTS() first."
 
-    # Emergency gain if the server produced near-silence
-    rms = float(np.sqrt(np.mean(np.maximum(y * y, 1e-12)))) if y.size else 0.0
-    if rms < 1e-4 and y.size > 0:  # ~ -80 dBFS
-        y *= 30.0  # +29.5 dB
-    return y, int(sr)
+    sys_prompt = _system_prompt(language)
 
-def _wav_bytes_from_array(y: np.ndarray, sr: int) -> bytes:
-    """Encode a float32 mono array as WAV bytes (for anchor/reference)."""
-    buf = io.BytesIO()
-    sf.write(buf, y.astype(np.float32, copy=False), sr, format="WAV", subtype="PCM_16")
-    return buf.getvalue()
-
-# -----------------------------
-# Caching for synthesized chunks
-# -----------------------------
-class _ChunkCache:
-    """Simple bounded dict (LRU-ish) for raw WAV bytes keyed by deterministic strings."""
-    def __init__(self, max_items: int = 256):
-        self.max_items = max_items
-        self._store: OrderedDict[str, bytes] = OrderedDict()
-
-    def get(self, key: str) -> bytes | None:
-        val = self._store.get(key)
-        if val is not None:
-            self._store.move_to_end(key)
-        return val
-
-    def put(self, key: str, value: bytes):
-        self._store[key] = value
-        self._store.move_to_end(key)
-        if len(self._store) > self.max_items:
-            self._store.popitem(last=False)
-
-_chunk_cache = _ChunkCache(max_items=512)
-
-def _hash_str(s: str | None) -> str:
-    if not s:
-        return "0"
-    return hashlib.blake2b(s.encode("utf-8"), digest_size=8).hexdigest()
-
-# -----------------------------
-# Synthesis
-# -----------------------------
-def _system_prompt(lang: str, style_text: str, zh_tone_hint: str) -> str:
-    lang_name = _LANG_NAME_NATIVE.get(lang, "target language")
-    return (
-        f"You must speak ONLY in {lang_name}. Do not speak any words in other languages. "
-        "Read the user text verbatim with native pronunciation and prosody. "
-        "Do NOT translate, paraphrase, or add words. Ignore any [SPEAKER*] tags, and do not read any hints aloud. "
-        "Use the accent/prosody of reference audios if provided; keep the same voice across all sentences. "
-        f"Target style: {style_text} {zh_tone_hint}"
-    )
-
-def _fewshot_anti_translate(lang: str) -> str:
-    name = _LANG_NAME_NATIVE.get(lang, "target language")
-    return (
-        f"【Example — DO NOT READ IN OUTPUT】\n"
-        f"Instruction: Speak only in {name} without translating the input. Read verbatim.\n"
-        f"Input: Hello AI.\n"
-        f"Output should be: Hello AI.\n"
-    )
-
-def _wrap_ssml_if_enabled(text: str, use_ssml: bool) -> str:
-    if not use_ssml:
-        return text
-    # Minimal, non-intrusive SSML-like wrapper
-    ssml = (
-        text.replace("，", "，<break time=\"180ms\"/>")
-            .replace(",", ", <break time=\"160ms\"/>")
-            .replace("。", "。<break time=\"220ms\"/>")
-            .replace(".", ". <break time=\"200ms\"/>")
-    )
-    return f"<speak><p>{ssml}</p></speak>"
-
-def _synthesize_chunk(client, model, lang: str, text_chunk: str,
-                      ref_b64_user: str | None, ref_b64_native: str | None,
-                      ref_b64_anchor: str | None,
-                      style_text: str,
-                      zh_tone_hint: str,
-                      prev_text: str | None,
-                      use_ssml: bool,
-                      use_fewshot: bool,
-                      # Deterministic defaults to avoid silent failures
-                      temperature=0.0, top_p=1.0, top_k=1, timeout_s=45) -> bytes:
-
-    messages = [{"role": "system", "content": _system_prompt(lang, style_text, zh_tone_hint)}]
-
-    # Few-shot nudge against translation/paraphrase (disabled by default)
-    if use_fewshot:
-        messages.append({"role": "user", "content": _fewshot_anti_translate(lang)})
-
-    # Prosody continuity context (not to be read aloud)
-    if prev_text:
-        messages.append({
-            "role": "assistant",
-            "content": f"[Context for prosody only — DO NOT READ ALOUD]\n{prev_text}"
-        })
-
-    # Native accent reference (steer accent/prosody)
-    if ref_b64_native:
+    # Boson expects: system -> (assistant with input_audio?) -> user (final text)
+    messages: List[Dict] = [{"role": "system", "content": sys_prompt}]
+    if ref_b64:
         messages.append({
             "role": "assistant",
             "content": [{
                 "type": "input_audio",
-                "input_audio": {"data": ref_b64_native, "format": "wav"}
+                "input_audio": {
+                    "data": ref_b64,
+                    "format": "wav"
+                }
             }],
         })
+    messages.append({"role": "user", "content": text})
 
-    # User timbre reference (keep identity)
-    if ref_b64_user:
-        messages.append({
-            "role": "assistant",
-            "content": [{
-                "type": "input_audio",
-                "input_audio": {"data": ref_b64_user, "format": "wav"}
-            }],
-        })
-
-    # Anchor reference from already-generated audio (stabilize voice/pitch)
-    if ref_b64_anchor:
-        messages.append({
-            "role": "assistant",
-            "content": [{
-                "type": "input_audio",
-                "input_audio": {"data": ref_b64_anchor, "format": "wav"}
-            }],
-        })
-
-    # Final input
-    text_payload = _wrap_ssml_if_enabled(text_chunk, use_ssml)
-    messages.append({"role": "user", "content": text_payload})
-
-    # >>> HOTFIX: force WAV format, include in both top-level arg and extra_body
-    resp = client.chat.completions.create(
-        model=model,
+    # NOTE: no explicit client timeout (let long generations finish)
+    chat_resp = _client.chat.completions.create(
+        model=model_name,
         messages=messages,
         modalities=["text", "audio"],
-        max_completion_tokens=2048,
-        temperature=temperature,
-        top_p=top_p,
+        max_completion_tokens=4096,
+        temperature=0.0,
+        top_p=1.0,
         stream=False,
         stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
-        audio={"format": "wav"},
-        extra_body={"top_k": top_k, "audio": {"format": "wav"}},
-        timeout=timeout_s,
+        extra_body={
+            "language": language,
+            "speed": float(max(0.5, min(2.0, speed))),
+            "top_k": 50,
+        },
     )
 
-    audio_b64 = _extract_audio_b64(resp)
-    # Optional: save first raw chunk for debugging
-    try:
-        raw = base64.b64decode(audio_b64)
-        if os.getenv("TTS_DEBUG_SAVE_FIRST", "0") == "1":
-            with open("tts_first_chunk.raw.wav", "wb") as dbg:
-                dbg.write(raw)
-    except Exception as e:
-        logger.error(f"[Higgs TTS] base64 decode failed: {e}")
-        raise
-    return raw
+    b64 = _extract_b64_from_chat(chat_resp)
+    if not b64:
+        raise RuntimeError("No audio data in chat response.")
+    wav_bytes = base64.b64decode(b64)
 
-def _synthesize_chunk_with_retry(client, model, lang, chunk,
-                                 ref_user_b64, ref_native_b64, ref_anchor_b64,
-                                 style_text, zh_tone_hint,
-                                 prev_text, use_ssml, use_fewshot,
-                                 max_retries, timeout_s):
-    # Deterministic cache key
-    key = "|".join([
-        model, lang,
-        str(len(chunk)), hashlib.blake2b(chunk.encode("utf-8"), digest_size=8).hexdigest(),
-        _hash_str(prev_text),
-        _hash_str(ref_user_b64), _hash_str(ref_native_b64), _hash_str(ref_anchor_b64),
-        _hash_str(style_text), _hash_str(zh_tone_hint),
-        "ssml1" if use_ssml else "ssml0",
-        "few1" if use_fewshot else "few0",
-    ])
+    # Decode WAV
+    if not (len(wav_bytes) > 12 and wav_bytes[:4] == b"RIFF" and wav_bytes[8:12] == b"WAVE"):
+        raise RuntimeError("Server did not return WAV. Ensure WAV output is enabled.")
 
-    cached = _chunk_cache.get(key)
-    if cached:
+    data, sr = sf.read(io.BytesIO(wav_bytes), always_2d=False, dtype="float32")
+    if isinstance(data, np.ndarray) and data.ndim == 2:
+        data = data.mean(axis=1)
+    wav = data.astype(np.float32, copy=False)
+
+    # Resample to 24k if needed
+    if sr != SR:
         try:
-            y, sr = _read_wav_bytes(cached)
-            if y.size >= 1000:
-                return y, sr
+            import librosa
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=SR)
         except Exception:
-            pass
+            logger.warning(f"[Higgs TTS] Resample unavailable; keeping native SR={sr}")
+            return _loudness_normalize(wav)
+    return _loudness_normalize(wav)
 
-    delay = 0.15
-    for attempt in range(max_retries):
-        try:
-            raw = _synthesize_chunk(
-                client, model, lang, chunk,
-                ref_user_b64, ref_native_b64, ref_anchor_b64,
-                style_text=style_text,
-                zh_tone_hint=zh_tone_hint,
-                prev_text=prev_text,
-                use_ssml=use_ssml,
-                use_fewshot=use_fewshot,
-                temperature=0.0,  # deterministic
-                top_p=1.0,
-                top_k=1,
-                timeout_s=timeout_s
-            )
-            y, sr = _read_wav_bytes(raw)
-            logger.debug(f"[Higgs TTS] chunk len={y.size} sr={sr} peak={float(np.max(np.abs(y))) if y.size else 0.0:.3f}")
-            if y.size < 1000:
-                raise ValueError("too-short audio")
-            _chunk_cache.put(key, raw)
-            return y, sr
-        except Exception as e:
-            logger.warning(f"[Higgs TTS] Chunk retry {attempt+1}/{max_retries} failed: {e}")
-            if attempt + 1 == max_retries:
-                raise
-            time.sleep(delay)
-            delay = min(delay * 2, 0.8)  # backoff
-
-# -----------------------------
-# Main TTS (drop-in)
-# -----------------------------
-def tts(text, output_path, speaker_wav, voice_type=None):
+# ------------------------------------------------------------------------------
+# Core synthesis (STREAMING PCM16 @ 24kHz mono)
+def _synthesize_once_stream_pcm16(
+    text: str,
+    language: str,
+    ref_b64: Optional[str],
+    model_name: str,
+    speed: float,
+) -> np.ndarray:
     """
-    Generate speech for `text` and write to `output_path` (wav).
-    - User timbre ref: `speaker_wav` (optional; we auto-extract a clean 2s reference)
-    - Native accent refs: .env TTS_REF_{EN,ZH,KO,ES,TA} (optional)
-    - Language lock: auto-detect or .env TTS_LANG_OVERRIDE
+    Streaming PCM16 path (24 kHz mono). Returns float32 [-1,1].
+    """
+    assert _client is not None, "Call init_TTS() first."
+
+    sys_prompt = _system_prompt(language)
+
+    messages: List[Dict] = [{"role": "system", "content": sys_prompt}]
+    if ref_b64:
+        messages.append({
+            "role": "assistant",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {
+                    "data": ref_b64,
+                    "format": "wav"
+                }
+            }],
+        })
+    messages.append({"role": "user", "content": text})
+
+    stream = _client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        modalities=["text", "audio"],
+        audio={"format": "pcm16"},  # request raw PCM16 chunks
+        stream=True,
+        max_completion_tokens=4096,
+        temperature=0.0,
+        top_p=1.0,
+        stop=["<|eot_id|>", "<|end_of_text|>", "<|audio_eos|>"],
+        extra_body={
+            "language": language,
+            "speed": float(max(0.5, min(2.0, speed))),
+            "top_k": 50,
+        },
+    )
+
+    # accumulate PCM16 frames
+    chunks_i16: List[np.ndarray] = []
+    for chunk in stream:
+        delta = getattr(chunk.choices[0], "delta", None)
+        if not delta:
+            continue
+        audio = getattr(delta, "audio", None)
+        if not audio:
+            continue
+        b = base64.b64decode(audio["data"])
+        if not b:
+            continue
+        # little-endian PCM16 mono @ 24kHz
+        arr = np.frombuffer(b, dtype="<i2")
+        if arr.size:
+            chunks_i16.append(arr)
+
+    if not chunks_i16:
+        # fallback to brief silence if nothing streamed
+        return np.zeros(int(0.1 * SR), dtype=np.float32)
+
+    i16 = np.concatenate(chunks_i16)
+    wav = (i16.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
+    return _loudness_normalize(wav)
+
+# ------------------------------------------------------------------------------
+# Public entry (compatible with dispatcher)
+def tts(text: str, output_path: str, speaker_wav: Optional[str], **kwargs) -> None:
+    """
+    Dispatcher-compatible entry:
+        higgs_tts(text, out_path, speaker_wav, target_language='中文', ...)
+
+    kwargs:
+        model_name, speed, max_workers, chunk_chars, retries, retry_backoff, xfade_ms
+        target_language   -> string label (mapped to 'zh-cn', 'en', ...)
+        use_stream        -> bool (override env HIGGS_TTS_STREAM)
     """
     if os.path.exists(output_path):
-        logger.info(f"[Higgs TTS] File already exists, skipping: {output_path}")
+        logger.info(f"[Higgs TTS] Exists, skipping {output_path}")
+        return
+    if not _initialized:
+        load_model()
+
+    model_name  = (kwargs.get("model_name") or _DEFAULT_MODEL).strip()
+    speed       = float(kwargs.get("speed") or _DEF_SPEED)
+    max_workers = max(1, int(kwargs.get("max_workers") or _DEF_WORKERS))
+    chunk_chars = max(120, int(kwargs.get("chunk_chars") or _DEF_CHARS))
+    retries     = max(1, int(kwargs.get("retries") or _DEF_RETRIES))
+    retry_back  = float(kwargs.get("retry_backoff") or _DEF_BACKOFF)
+    xfade_ms    = int(kwargs.get("xfade_ms") or _DEF_XF_MS)
+    use_stream  = bool(kwargs.get("use_stream", _USE_STREAM))
+
+    raw_lang = kwargs.get("target_language")
+    if raw_lang:
+        language = _map_lang(raw_lang)
+    else:
+        language = _guess_lang(text)
+    if language not in _SUPPORTED:
+        logger.warning(f"[Higgs TTS] Unsupported language '{language}', defaulting to English")
+        language = 'en'
+
+    # Read reference timbre once and pre-encode base64 (avoid per-chunk re-encoding)
+    ref_b64 = None
+    if speaker_wav and os.path.isfile(speaker_wav):
+        try:
+            with open(speaker_wav, "rb") as f:
+                ref_b64 = base64.b64encode(f.read()).decode("utf-8")
+        except Exception as e:
+            logger.warning(f"[Higgs TTS] Failed to read speaker wav: {e}")
+
+    text = (text or "").strip()
+    if not text:
+        save_wav(np.zeros(int(0.1 * SR), dtype=np.float32), output_path)
         return
 
-    client, model, cfg = _get_client_and_model()
-    # Safety: disable SSML & few-shot if you want hard guarantee of audio generation
-    # (You can re-enable by setting env TTS_USE_SSML=1 or TTS_USE_FEWSHOT=1)
-    use_ssml = bool(cfg["use_ssml"])
-    use_fewshot = bool(cfg["use_fewshot"])
+    segments = _split_text(text, chunk_chars, language)
+    logger.debug(f"[Higgs TTS] {language} | chunks={len(segments)} | model={model_name} | stream={use_stream}")
 
-    # Text prep
-    text_norm = _normalize_text(text)
-    lang = _detect_lang(text_norm, cfg.get("lang_override", ""))
-    text_norm = _inject_soft_breaks(text_norm, lang)
+    # Conservative parallelism for CJK to improve prosody/consistency
+    effective_workers = min(max_workers, len(segments))
+    if language in ("zh-cn", "ja", "ko"):
+        effective_workers = 1
 
-    # Load per-language native accent references (once)
-    native_refs = _load_lang_refs_from_env()
-    ref_native_b64 = native_refs.get(lang)
+    synth_fn = _synthesize_once_stream_pcm16 if use_stream else _synthesize_once
 
-    # User timbre reference (cleaned segment preferred)
-    ref_user_b64, ref_key = None, "no-ref"
-    clean_ref = None
-    if speaker_wav and os.path.exists(speaker_wav):
-        try:
-            clean_ref = _select_clean_ref_segment(speaker_wav, target_sr=cfg["target_sr"], seg_seconds=2.0)
-            if clean_ref is not None and clean_ref.size > 0:
-                ref_user_b64 = base64.b64encode(_wav_bytes_from_array(clean_ref, cfg["target_sr"])).decode("utf-8")
-                ref_key = f"{os.path.basename(speaker_wav)}:{clean_ref.size}"
-                logger.info(f"[Higgs TTS] Using CLEANED user reference from: {speaker_wav}")
-            else:
-                with open(speaker_wav, "rb") as f:
-                    ref_user_b64 = base64.b64encode(f.read()).decode("utf-8")
-                ref_key = f"{os.path.basename(speaker_wav)}:{len(ref_user_b64)}"
-                logger.warning("[Higgs TTS] Clean reference selection failed; using raw file")
-        except Exception as e:
-            logger.warning(f"[Higgs TTS] Failed to prepare user reference, proceeding without it: {e}")
-            ref_user_b64, ref_key = None, "no-ref"
+    def _task(i_text):
+        i, seg = i_text
+        delay = 0.0
+        for r in range(retries):
+            try:
+                if delay:
+                    time.sleep(delay + random.random() * 0.15)  # jitter
+                audio = synth_fn(seg, language, ref_b64, model_name, speed)
+                return i, audio
+            except Exception as e:
+                logger.warning(f"[Higgs TTS] chunk {i+1}/{len(segments)} failed: {e}")
+                delay = retry_back * (2 ** r)
+        # keep timeline sane on total failure
+        return i, np.zeros(int(0.2 * SR), dtype=np.float32)
 
-    # Chunking
-    chunks = _split_sentences(text_norm, lang, cfg["chunk_chars"])
-    if not chunks:
-        raise RuntimeError("No text to synthesize")
-
-    style_text = _style_note(lang)
-    zh_tone_anchor = _make_zh_tone_hint(chunks[0]) if lang == "zh" else ""
-
-    # ---- 1) Generate ANCHOR chunk serially (first chunk) ----
-    t0 = time.time()
-    y_anchor, sr_anchor = _synthesize_chunk_with_retry(
-        client, model, lang, chunks[0],
-        ref_user_b64, ref_native_b64, None,      # no anchor yet
-        style_text=style_text,
-        zh_tone_hint=zh_tone_anchor,             # tone hint only on anchor
-        prev_text=None,
-        use_ssml=use_ssml,
-        use_fewshot=use_fewshot,
-        max_retries=cfg["max_retries"],
-        timeout_s=cfg["timeout_s"]
-    )
-
-    # Build anchor reference: first ~2s to bias voice across all remaining chunks
-    target_sr = cfg["target_sr"]
-    if sr_anchor != target_sr:
-        y_anchor_rs = _resample_linear(y_anchor, sr_anchor, target_sr)
+    results: List[Tuple[int, np.ndarray]] = []
+    if len(segments) == 1:
+        # Fast path (no executor overhead)
+        results = [(0, synth_fn(segments[0], language, ref_b64, model_name, speed))]
     else:
-        y_anchor_rs = y_anchor
+        with ThreadPoolExecutor(max_workers=effective_workers) as ex:
+            futs = [ex.submit(_task, (i, s)) for i, s in enumerate(segments)]
+            for fut in as_completed(futs):
+                results.append(fut.result())
 
-    anchor_seconds = min(2.0, max(0.8, y_anchor_rs.size / max(target_sr, 1)))
-    anchor_samps = int(anchor_seconds * target_sr)
-    anchor_clip = y_anchor_rs[:anchor_samps]
-    anchor_b64 = base64.b64encode(_wav_bytes_from_array(anchor_clip, target_sr)).decode("utf-8")
+    ordered = [w for (_i, w) in sorted(results, key=lambda t: t[0])]
+    joined = _concat_xfade(ordered, sr=SR, xf_ms=xfade_ms)
+    if joined.size < int(0.1 * SR):
+        joined = np.zeros(int(0.1 * SR), dtype=np.float32)
 
-    y_list = [None] * len(chunks)
-    sr_list = [None] * len(chunks)
-    y_list[0], sr_list[0] = y_anchor, sr_anchor
-
-    # ---- 2) Generate remaining chunks in parallel WITH ANCHOR ----
-    rest = [(i, c) for i, c in enumerate(chunks) if i != 0]
-    workers = min(cfg["workers"], max(1, len(rest)))
-
-    if rest:
-        def _work(pair):
-            i, ck = pair
-            prev_txt = chunks[i-1] if i > 0 else None
-            y, sr = _synthesize_chunk_with_retry(
-                client, model, lang, ck,
-                ref_user_b64, ref_native_b64, anchor_b64,
-                style_text=style_text,
-                zh_tone_hint="",               # only anchor uses tone hint
-                prev_text=prev_txt,            # continuity cue
-                use_ssml=use_ssml,
-                use_fewshot=use_fewshot,
-                max_retries=cfg["max_retries"],
-                timeout_s=cfg["timeout_s"]
-            )
-            return i, y, sr
-
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for i, y_sr in zip((i for i, _ in rest), ex.map(_work, rest)):
-                i2, y, sr = y_sr
-                y_list[i2], sr_list[i2] = y, sr
-
-    # ---- 3) Align SR, stitch, normalize, optional speed ----
-    for i in range(len(y_list)):
-        if y_list[i] is None:
-            raise RuntimeError(f"Missing audio for chunk {i}")
-    for i in range(len(y_list)):
-        if sr_list[i] != target_sr:
-            y_list[i] = _resample_linear(y_list[i], sr_list[i], target_sr)
-            sr_list[i] = target_sr
-
-    # order preserved; crossfade hides joins, anchor keeps tone/pitch stable
-    y_all = _concat_with_crossfade(y_list, target_sr, xf_ms=28)
-    y_all = _loudness_normalize(y_all, target_dbfs=-16.0)
-
-    if abs(cfg.get("speed_ratio", 1.0) - 1.0) > 1e-3:
-        r = cfg["speed_ratio"]
-        y_all = _resample_linear(y_all, target_sr, int(round(target_sr * r)))
-        target_sr = int(round(target_sr * r))
-
-    n = int(0.01 * target_sr)
-    if y_all.size > 2 * n:
-        y_all[:n] *= np.linspace(0.2, 1.0, n, dtype=np.float32)
-        y_all[-n:] *= np.linspace(1.0, 0.2, n, dtype=np.float32)
-
-    sf.write(output_path, y_all.astype(np.float32, copy=False), target_sr)
-    dur = y_all.size / max(target_sr, 1)
-    logger.info(f"[Higgs TTS] Saved: {output_path} | lang={lang} | chunks={len(chunks)} "
-                f"(anchor+{len(rest)}) | workers={workers} | dur={dur:.2f}s | wall={time.time()-t0:.2f}s")
-    return
-
-if __name__ == '__main__':
-    pass
+    save_wav(joined, output_path)
+    logger.info(f"[Higgs TTS] Saved {output_path} | dur≈{joined.size/SR:.2f}s")
