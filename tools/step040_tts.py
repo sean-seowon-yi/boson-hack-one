@@ -1,145 +1,240 @@
-import json
+# -*- coding: utf-8 -*-
 import os
 import re
+import json
 import librosa
-
-from loguru import logger
 import numpy as np
+from loguru import logger
 
 from .utils import save_wav, save_wav_norm
-# from .step041_tts_bytedance import tts as bytedance_tts
+from .cn_tx import TextNorm
+from audiostretchy.stretch import stretch_audio
+
+# TTS backends (each must expose: tts(text, output_path, speaker_wav, ...))
 from .step042_tts_xtts import tts as xtts_tts
 from .step043_tts_cosyvoice import tts as cosyvoice_tts
 from .step044_tts_edge_tts import tts as edge_tts
-from .cn_tx import TextNorm
-from audiostretchy.stretch import stretch_audio
+# NEW: Higgs/Boson TTS (OpenAI-compatible)
+from .step041_tts_higgs import tts as higgs_tts  # ensure this file exists
+
 normalizer = TextNorm()
-def preprocess_text(text):
+
+def preprocess_text(text: str) -> str:
+    # keep your prior behavior
     text = text.replace('AI', '人工智能')
     text = re.sub(r'(?<!^)([A-Z])', r' \1', text)
     text = normalizer(text)
-    # 使用正则表达式在字母和数字之间插入空格
+    # insert space between letters and digits
     text = re.sub(r'(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])', ' ', text)
     return text
-    
-    
-def adjust_audio_length(wav_path, desired_length, sample_rate = 24000, min_speed_factor = 0.6, max_speed_factor = 1.1):
+
+
+def adjust_audio_length(
+    wav_path: str,
+    desired_length: float,
+    sample_rate: int = 24000,
+    min_speed_factor: float = 0.6,
+    max_speed_factor: float = 1.1
+):
+    # Load (fallback to .mp3 if needed)
     try:
         wav, sample_rate = librosa.load(wav_path, sr=sample_rate)
-    except Exception as e:
+    except Exception:
         if wav_path.endswith('.wav'):
-            wav_path = wav_path.replace('.wav', '.mp3')
-        wav, sample_rate = librosa.load(wav_path, sr=sample_rate)
-    current_length = len(wav)/sample_rate
-    speed_factor = max(
-        min(desired_length / current_length, max_speed_factor), min_speed_factor)
-    logger.info(f"Speed Factor {speed_factor}")
-    desired_length = current_length * speed_factor
+            alt = wav_path.replace('.wav', '.mp3')
+        elif wav_path.endswith('.mp3'):
+            alt = wav_path
+        else:
+            alt = wav_path
+        wav, sample_rate = librosa.load(alt, sr=sample_rate)
+
+    current_length = len(wav) / sample_rate
+    if current_length <= 1e-6:
+        # avoid division by zero; return silence
+        return np.zeros(0, dtype=np.float32), 0.0
+
+    speed_factor = max(min(desired_length / current_length, max_speed_factor), min_speed_factor)
+    logger.info(f"Speed Factor {speed_factor:.3f}")
+
+    # output path for stretched version
     if wav_path.endswith('.wav'):
-        target_path = wav_path.replace('.wav', f'_adjusted.wav')
+        target_path = wav_path.replace('.wav', '_adjusted.wav')
     elif wav_path.endswith('.mp3'):
-        target_path = wav_path.replace('.mp3', f'_adjusted.wav')
+        target_path = wav_path.replace('.mp3', '_adjusted.wav')
+    else:
+        target_path = wav_path + '_adjusted.wav'
+
+    # stretch + reload
     stretch_audio(wav_path, target_path, ratio=speed_factor, sample_rate=sample_rate)
     wav, sample_rate = librosa.load(target_path, sr=sample_rate)
-    return wav[:int(desired_length*sample_rate)], desired_length
 
+    new_len = min(desired_length, len(wav) / sample_rate)
+    return wav[:int(new_len * sample_rate)].astype(np.float32), new_len
+
+
+# Language capability map per backend (UI enforces these)
 tts_support_languages = {
-    # XTTS-v2 supports 17 languages: English (en), Spanish (es), French (fr), German (de), Italian (it), Portuguese (pt), Polish (pl), Turkish (tr), Russian (ru), Dutch (nl), Czech (cs), Arabic (ar), Chinese (zh-cn), Japanese (ja), Hungarian (hu), Korean (ko) Hindi (hi).
-    'xtts': ['中文', 'English', 'Japanese', 'Korean', 'French', 'Polish', 'Spanish'],
-    'bytedance': [],
-    'GPTSoVits': [],
-    'EdgeTTS': ['中文', 'English', 'Japanese', 'Korean', 'French', 'Polish', 'Spanish'],
-    # zero_shot usage, <|zh|><|en|><|jp|><|yue|><|ko|> for Chinese/English/Japanese/Cantonese/Korean
-    'cosyvoice': ['中文', '粤语', 'English', 'Japanese', 'Korean', 'French'], 
+    # XTTS: keep your surfaced set (XTTS supports many more; we keep parity with UI)
+    'xtts':     ['中文', 'English', 'Japanese', 'Korean', 'French', 'Polish', 'Spanish'],
+    # EdgeTTS via Azure voices
+    'EdgeTTS':  ['中文', 'English', 'Japanese', 'Korean', 'French', 'Polish', 'Spanish'],
+    # CosyVoice zero-shot markers (as you had)
+    'cosyvoice':['中文', '粤语', 'English', 'Japanese', 'Korean', 'French'],
+    # NEW: Higgs (voice cloning via reference) – support the same set you expose in UI
+    'Higgs':    ['中文', 'English', 'Japanese', 'Korean', 'French', 'Spanish', 'Polish'],
 }
 
-def generate_wavs(method, folder, target_language='中文', voice = 'zh-CN-XiaoxiaoNeural'):
-    assert method in ['xtts', 'bytedance', 'cosyvoice', 'EdgeTTS']
+
+def _synthesize_one_line(method: str, text: str, out_path: str, speaker_wav: str,
+                         target_language: str, voice: str):
+    """
+    Dispatch to the selected backend. Backends write WAV to out_path.
+    """
+    if method == 'xtts':
+        xtts_tts(text, out_path, speaker_wav, target_language=target_language)
+    elif method == 'cosyvoice':
+        cosyvoice_tts(text, out_path, speaker_wav, target_language=target_language)
+    elif method == 'EdgeTTS':
+        edge_tts(text, out_path, target_language=target_language, voice=voice)
+    elif method == 'Higgs':
+        # Higgs TTS (OpenAI-compatible). Reference speaker is optional but recommended.
+        higgs_tts(text, out_path, speaker_wav)
+    else:
+        raise ValueError(f"Unknown TTS method: {method}")
+
+
+def generate_wavs(method: str, folder: str, target_language: str = '中文', voice: str = 'zh-CN-XiaoxiaoNeural'):
+    """
+    Generate per-line WAVs and the combined track for one video's folder.
+
+    RETURNS (strictly two values):
+        (combined_wav_path, original_audio_path)
+    """
+    # Validate method & language support deterministically
+    supported = tts_support_languages.get(method, [])
+    if supported and target_language not in supported:
+        raise ValueError(f"TTS method '{method}' does not support target language '{target_language}'")
+
     transcript_path = os.path.join(folder, 'translation.json')
-    output_folder = os.path.join(folder, 'wavs')
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+    if not os.path.exists(transcript_path):
+        raise FileNotFoundError(f"translation.json not found in {folder}")
+
     with open(transcript_path, 'r', encoding='utf-8') as f:
         transcript = json.load(f)
-    speakers = set()
-    
-    for line in transcript:
-        speakers.add(line['speaker'])
-    num_speakers = len(speakers)
-    logger.info(f'Found {num_speakers} speakers')
 
-    if target_language not in tts_support_languages[method]:
-        logger.error(f'{method} does not support {target_language}')
-        return f'{method} does not support {target_language}'
-        
-    full_wav = np.zeros((0, ))
+    # Create output directory
+    output_folder = os.path.join(folder, 'wavs')
+    os.makedirs(output_folder, exist_ok=True)
+
+    # Collect speakers (for info)
+    speakers = {line.get('speaker', 'SPEAKER_00') for line in transcript}
+    logger.info(f'Found {len(speakers)} speakers')
+
+    # Build combined wav progressively
+    full_wav = np.zeros((0,), dtype=np.float32)
+
     for i, line in enumerate(transcript):
-        speaker = line['speaker']
-        text = preprocess_text(line['translation'])
-        output_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
-        speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
-        # if num_speakers == 1:
-            # bytedance_tts(text, output_path, speaker_wav, voice_type='BV701_streaming')
-        
-        if method == 'bytedance':
-            bytedance_tts(text, output_path, speaker_wav, target_language = target_language)
-        elif method == 'xtts':
-            xtts_tts(text, output_path, speaker_wav, target_language = target_language)
-        elif method == 'cosyvoice':
-            cosyvoice_tts(text, output_path, speaker_wav, target_language = target_language)
-        elif method == 'EdgeTTS':
-            edge_tts(text, output_path, target_language = target_language, voice = voice)
-        start = line['start']
-        end = line['end']
-        length = end-start
-        last_end = len(full_wav)/24000
-        if start > last_end:
-            full_wav = np.concatenate((full_wav, np.zeros((int((start - last_end) * 24000), ))))
-        start = len(full_wav)/24000
-        line['start'] = start
-        if i < len(transcript) - 1:
-            next_line = transcript[i+1]
-            next_end = next_line['end']
-            end = min(start + length, next_end)
-        wav, length = adjust_audio_length(output_path, end-start)
+        speaker = line.get('speaker', 'SPEAKER_00')
+        text = preprocess_text(line.get('translation', '').strip())
+        if not text:
+            # If empty translation, keep timing with silence
+            logger.warning(f'Empty translation for line {i}, inserting silence.')
+            text = ""
 
-        full_wav = np.concatenate((full_wav, wav))
-        line['end'] = start + length
-        
-    vocal_wav, sr = librosa.load(os.path.join(folder, 'audio_vocals.wav'), sr=24000)
-    full_wav = full_wav / np.max(np.abs(full_wav)) * np.max(np.abs(vocal_wav))
-    save_wav(full_wav, os.path.join(folder, 'audio_tts.wav'))
+        out_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
+        speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
+
+        # Synthesize (idempotent: backends skip if out_path exists)
+        _synthesize_one_line(method, text, out_path, speaker_wav, target_language, voice)
+
+        # Timing adjustment
+        start = float(line['start'])
+        end = float(line['end'])
+        length = max(0.0, end - start)
+        last_end = len(full_wav) / 24000.0
+
+        # Pad gap if any
+        if start > last_end:
+            pad_len = int((start - last_end) * 24000)
+            if pad_len > 0:
+                full_wav = np.concatenate((full_wav, np.zeros((pad_len,), dtype=np.float32)))
+
+        # Update start to the current end of full_wav
+        start = len(full_wav) / 24000.0
+        line['start'] = start
+
+        # Avoid overlap with next line
+        if i < len(transcript) - 1:
+            next_end = float(transcript[i + 1]['end'])
+            end = min(start + length, next_end)
+
+        # Stretch/crop synthesized line to fit the slot
+        wav_seg, adj_len = adjust_audio_length(out_path, end - start)
+        full_wav = np.concatenate((full_wav, wav_seg.astype(np.float32)))
+        line['end'] = start + adj_len
+
+    # Match energy with original vocals
+    vocal_path = os.path.join(folder, 'audio_vocals.wav')
+    if os.path.exists(vocal_path):
+        vocal_wav, _sr = librosa.load(vocal_path, sr=24000)
+        peak = float(np.max(np.abs(vocal_wav))) if vocal_wav.size else 1.0
+        if peak > 0 and np.max(np.abs(full_wav)) > 0:
+            full_wav = full_wav / np.max(np.abs(full_wav)) * peak
+
+    # Save TTS-only track and write back timing updates
+    tts_path = os.path.join(folder, 'audio_tts.wav')
+    save_wav(full_wav, tts_path)
     with open(transcript_path, 'w', encoding='utf-8') as f:
         json.dump(transcript, f, indent=2, ensure_ascii=False)
-    
-    instruments_wav, sr = librosa.load(os.path.join(folder, 'audio_instruments.wav'), sr=24000)
-    len_full_wav = len(full_wav)
-    len_instruments_wav = len(instruments_wav)
-    
-    if len_full_wav > len_instruments_wav:
-        # 如果 full_wav 更长，将 instruments_wav 延伸到相同长度
-        instruments_wav = np.pad(
-            instruments_wav, (0, len_full_wav - len_instruments_wav), mode='constant')
-    elif len_instruments_wav > len_full_wav:
-        # 如果 instruments_wav 更长，将 full_wav 延伸到相同长度
-        full_wav = np.pad(
-            full_wav, (0, len_instruments_wav - len_full_wav), mode='constant')
-    combined_wav = full_wav + instruments_wav
-    # combined_wav /= np.max(np.abs(combined_wav))
-    save_wav_norm(combined_wav, os.path.join(folder, 'audio_combined.wav'))
-    logger.info(f'Generated {os.path.join(folder, "audio_combined.wav")}')
-    return os.path.join(folder, 'audio_combined.wav'), os.path.join(folder, 'audio.wav')
 
-def generate_all_wavs_under_folder(root_folder, method, target_language='中文', voice = 'zh-CN-XiaoxiaoNeural'):
+    # Mix with instruments
+    inst_path = os.path.join(folder, 'audio_instruments.wav')
+    if os.path.exists(inst_path):
+        instruments_wav, _sr = librosa.load(inst_path, sr=24000)
+    else:
+        instruments_wav = np.zeros_like(full_wav)
+
+    # Length align
+    len_full = len(full_wav)
+    len_inst = len(instruments_wav)
+    if len_full > len_inst:
+        instruments_wav = np.pad(instruments_wav, (0, len_full - len_inst), mode='constant')
+    elif len_inst > len_full:
+        full_wav = np.pad(full_wav, (0, len_inst - len_full), mode='constant')
+
+    combined = full_wav + instruments_wav
+    combined_path = os.path.join(folder, 'audio_combined.wav')
+    save_wav_norm(combined, combined_path)
+    logger.info(f'Generated {combined_path}')
+
+    # Return strictly two values (EXPECTED by callers)
+    return combined_path, os.path.join(folder, 'audio.wav')
+
+
+def generate_all_wavs_under_folder(root_folder: str, method: str,
+                                   target_language: str = '中文',
+                                   voice: str = 'zh-CN-XiaoxiaoNeural'):
+    """
+    Walk `root_folder`, generate TTS where needed.
+
+    RETURNS (strictly three values):
+        (status_text, combined_wav_path_or_None, original_audio_path_or_None)
+    """
     wav_combined, wav_ori = None, None
     for root, dirs, files in os.walk(root_folder):
         if 'translation.json' in files and 'audio_combined.wav' not in files:
+            # always EXACTLY two returns here
             wav_combined, wav_ori = generate_wavs(method, root, target_language, voice)
         elif 'audio_combined.wav' in files:
-            wav_combined, wav_ori = os.path.join(root, 'audio_combined.wav'), os.path.join(root, 'audio.wav')
+            wav_combined = os.path.join(root, 'audio_combined.wav')
+            wav_ori = os.path.join(root, 'audio.wav')
             logger.info(f'Wavs already generated in {root}')
+
     return f'Generated all wavs under {root_folder}', wav_combined, wav_ori
 
+
 if __name__ == '__main__':
-    folder = r'videos/村长台钓加拿大/20240805 英文无字幕 阿里这小子在水城威尼斯发来问候'
-    generate_wavs('xtts', folder)
+    # Example quick test
+    # folder = r'videos/ExampleUploader/20240805 Demo Video'
+    # print(generate_wavs('xtts', folder))
+    pass

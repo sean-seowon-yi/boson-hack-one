@@ -4,27 +4,41 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from loguru import logger
 
-extra_body = {
-    'repetition_penalty': 1.1,
+load_dotenv()
+
+# Pull config from .env
+MODEL_NAME = os.getenv("QWEN_TRANSLATION_MODEL", "Qwen3-32B-thinking-Hackathon")
+BASE_URL   = os.getenv("BOSON_BASE_URL", "https://hackathon.boson.ai/v1")
+API_KEY    = os.getenv("BOSON_API_KEY", "")
+
+# Optional generation controls
+EXTRA_BODY = {
+    "repetition_penalty": 1.1,
 }
-model_name = os.getenv('MODEL_NAME', 'gpt-3.5-turbo')
-def openai_response(messages):
-    client = OpenAI(
-        # This is the default and can be omitted
-        base_url=os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1'),
-        api_key=os.getenv('OPENAI_API_KEY')
-    )
-    if 'gpt' not in model_name:
-        model_name = 'gpt-3.5-turbo'
-    response = client.chat.completions.create(
-        model=model_name,
+
+def boson_openai_response(messages):
+    """
+    OpenAI-compatible chat call against Boson Hackathon endpoint.
+    Uses model from QWEN_TRANSLATION_MODEL.
+    """
+    if not API_KEY:
+        raise RuntimeError("BOSON_API_KEY is not set in environment/.env")
+
+    client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
         messages=messages,
         timeout=240,
-        extra_body=extra_body
+        extra_body=EXTRA_BODY,
     )
-    return response.choices[0].message.content
+    return resp.choices[0].message.content
 
-if __name__ == '__main__':
-    test_message = [{"role": "user", "content": "你好，介绍一下你自己"}]
-    response = openai_response(test_message)
-    print(response)
+# --- Backwards-compatible alias so existing imports keep working ---
+def openai_response(messages):
+    """Alias kept for compatibility with step030_translation.py."""
+    return boson_openai_response(messages)
+
+if __name__ == "__main__":
+    test_message = [{"role": "user", "content": "Briefly introduce yourself."}]
+    logger.info(f"Using Boson model: {MODEL_NAME} @ {BASE_URL}")
+    print(openai_response(test_message))

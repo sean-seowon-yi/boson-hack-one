@@ -1,61 +1,44 @@
 # -*- coding: utf-8 -*-
-import json
 import os
-import re
-import torch
 from dotenv import load_dotenv
-import time
 from loguru import logger
+from openai import OpenAI
 
+# Load environment variables
 load_dotenv()
 
-model = None
-tokenizer = None
-model_name = os.getenv('MODEL_NAME', 'qwen/Qwen1.5-4B-Chat')
-if 'Qwen' not in model_name:
-    model_name = 'qwen/Qwen1.5-4B-Chat'
+# Pull from .env (see your provided .env)
+MODEL_NAME = os.getenv("QWEN_TRANSLATION_MODEL", "Qwen3-32B-thinking-Hackathon")
+BOSON_API_KEY = os.getenv("BOSON_API_KEY")  # seansean
+BOSON_BASE_URL = os.getenv("BOSON_BASE_URL", "https://hackathon.boson.ai/v1")
 
-def init_llm_model(model_name):
-    global model, tokenizer
-    if 'Qwen' in model_name:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        model_path = os.path.join('models/LLM', os.path.basename(model_name))
-        pretrained_path = model_name if not os.path.isdir(model_path) else model_path
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            pretrained_path,
-            torch_dtype="auto",
-            device_map="auto"
-        )
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_path)
-        print('Finish Load model', pretrained_path)
+# Initialize OpenAI-compatible client once
+client = OpenAI(api_key=BOSON_API_KEY, base_url=BOSON_BASE_URL)
 
-def llm_response(messages, device='auto'):
-    if model is None:
-        init_llm_model(model_name)
-    if 'Qwen' in model_name:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        if device == 'auto':
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        model_inputs = tokenizer([text], return_tensors="pt").to(device)
+# Keep function signature for compatibility with existing imports/callers
+def init_llm_model(model_name: str = None):
+    """
+    Kept for backwards compatibility. No-op now that we use a hosted model.
+    """
+    chosen = model_name or MODEL_NAME
+    logger.info(f"[LLM init] Using hosted model: {chosen} @ {BOSON_BASE_URL}")
 
-        generated_ids = model.generate(
-            model_inputs.input_ids,
-            max_new_tokens=512
-        )
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
+def llm_response(messages, device: str = "auto"):
+    """
+    Hosted LLM response via Boson OpenAI-compatible API.
+    Returns string content (first choice), mirroring previous behavior.
+    """
+    # ensure model is "initialized" (log only)
+    init_llm_model(MODEL_NAME)
 
-        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        return response
-    return ''
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        timeout=240,
+    )
+    return resp.choices[0].message.content.strip()
 
-if __name__ == '__main__':
-    test_message = [{"role": "user", "content": "你好，介绍一下你自己"}]
-    response = llm_response(test_message)
-    print(response)
+if __name__ == "__main__":
+    test_message = [{"role": "user", "content": "Briefly introduce yourself."}]
+    logger.info(f"Using model: {MODEL_NAME} @ {BOSON_BASE_URL}")
+    print(llm_response(test_message))

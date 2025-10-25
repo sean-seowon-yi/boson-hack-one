@@ -5,35 +5,94 @@ import numpy as np
 from dotenv import load_dotenv
 from .step021_asr_whisperx import whisperx_transcribe_audio
 from .step022_asr_funasr import funasr_transcribe_audio
+from .step023_asr_higgs import higgs_transcribe_audio
 from .utils import save_wav
 import json
 import librosa
 from loguru import logger
 load_dotenv()
 
-def merge_segments(transcript, ending='!"\').:;?]}~！“”’）。：；？】'):
-    merged_transcription = []
-    buffer_segment = None
+def merge_segments(
+    segments,
+    max_gap: float = 0.40,          # seconds: merge if next.start - prev.end <= max_gap
+    max_chars: int = 120,           # don't let merged text grow too long
+    joiner: str = " "
+):
+    """
+    Merge short/adjacent ASR segments into larger sentences.
+    Safely handles empty text to avoid IndexError.
+    Input:  List[{"start": float, "end": float, "text": str, "speaker": str}]
+    Output: Same shape, merged.
+    """
+    if not segments:
+        return []
 
-    for segment in transcript:
-        if buffer_segment is None:
-            buffer_segment = segment
+    # sort just in case
+    segs = sorted(segments, key=lambda x: float(x.get("start", 0.0)))
+
+    # sentence-ending characters across languages
+    ending = set(list(".!?。！？…」』”’】》") + ["]", "）", ")"])
+
+    merged = []
+    buffer = None
+
+    def _clean_text(s):
+        # normalize text to avoid None and trailing/leading spaces
+        return (s or "").strip()
+
+    for seg in segs:
+        text = _clean_text(seg.get("text", ""))
+        # Skip segments with no text at all
+        if not text:
+            continue
+
+        start = float(seg.get("start", 0.0))
+        end   = float(seg.get("end", start))
+        spk   = seg.get("speaker", "SPEAKER_00")
+
+        if buffer is None:
+            buffer = {
+                "start": start,
+                "end": end,
+                "text": text,
+                "speaker": spk,
+            }
+            continue
+
+        # Only merge if:
+        #   1) temporal gap is small
+        #   2) same speaker (optional but typical for diarized streams)
+        #   3) previous buffer doesn't already end with sentence punctuation
+        #   4) max length constraint respected
+        gap = max(0.0, start - float(buffer["end"]))
+        prev_text = _clean_text(buffer["text"])
+        prev_last = prev_text[-1] if prev_text else ""
+        prev_ends_sentence = prev_last in ending
+
+        can_merge = (
+            gap <= max_gap
+            and spk == buffer["speaker"]
+            and not prev_ends_sentence
+            and (len(prev_text) + 1 + len(text) <= max_chars)
+        )
+
+        if can_merge:
+            buffer["text"] = (prev_text + joiner + text).strip()
+            buffer["end"] = max(float(buffer["end"]), end)
         else:
-            # Check if the last character of the 'text' field is a punctuation mark
-            if buffer_segment['text'][-1] in ending:
-                # If it is, add the buffered segment to the merged transcription
-                merged_transcription.append(buffer_segment)
-                buffer_segment = segment
-            else:
-                # If it's not, merge this segment with the buffered segment
-                buffer_segment['text'] += ' ' + segment['text']
-                buffer_segment['end'] = segment['end']
+            merged.append(buffer)
+            buffer = {
+                "start": start,
+                "end": end,
+                "text": text,
+                "speaker": spk,
+            }
 
-    # Don't forget to add the last buffered segment
-    if buffer_segment is not None:
-        merged_transcription.append(buffer_segment)
+    if buffer is not None:
+        merged.append(buffer)
 
-    return merged_transcription
+    return merged
+
 
 def generate_speaker_audio(folder, transcript):
     wav_path = os.path.join(folder, 'audio_vocals.wav')
@@ -75,6 +134,8 @@ def transcribe_audio(method, folder, model_name: str = 'large', download_root='m
         transcript = whisperx_transcribe_audio(wav_path, model_name, download_root, device, batch_size, diarization, min_speakers, max_speakers)
     elif method == 'FunASR':
         transcript = funasr_transcribe_audio(wav_path, device, batch_size, diarization)
+    elif method == 'Higgs':
+        transcript = higgs_transcribe_audio(wav_path, device, batch_size, diarization)
     else:
         logger.error('Invalid ASR method')
         raise ValueError('Invalid ASR method')
