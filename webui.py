@@ -45,7 +45,9 @@ full_auto_interface = gr.Interface(
 
         # Translation — route “LLM” to Boson/Qwen in your code; remove OpenAI/Ernie
         gr.Dropdown(
-            ["LLM", "Google Translate", "Bing Translate"],
+            ["LLM",
+            #  "Google Translate", "Bing Translate"
+             ],
             label="Translation method (LLM uses Boson/Qwen)",
             value="LLM",
         ),
