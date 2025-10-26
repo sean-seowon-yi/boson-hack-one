@@ -169,9 +169,6 @@ full_auto_interface = gr.Interface(
 
         # Translation
         gr.Dropdown(["LLM"], label="Translation method (LLM uses Boson/Qwen)", value="LLM"),
-
-        # --- WARNING above Subtitle language ---
-        gr.Markdown("⚠️ **Note:** For now, please keep the *Subtitle language* and the *TTS target language* the same to ensure proper alignment."),
         gr.Dropdown(
             ["Simplified Chinese (简体中文)", "English", "Korean", "Spanish"],
             label="Subtitle language",
@@ -202,8 +199,6 @@ full_auto_interface = gr.Interface(
         gr.Slider(minimum=1, maximum=100, step=1, label="Max workers", value=1, visible=False),
         gr.Slider(minimum=1, maximum=10, step=1, label="Max retries", value=3, visible=False),
 
-        # --- WARNING above Emotion controls ---
-        gr.Markdown("⚠️ **Experimental:** Emotion shaping is under active development. It works, but audio can be choppy."),
         # --- NEW: Emotion controls (auto-tuned via Higgs-understanding in pipeline) ---
         gr.Dropdown(
             ["natural", "happy", "sad", "angry"],
