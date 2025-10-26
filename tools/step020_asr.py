@@ -3,7 +3,7 @@ import os
 import torch
 import numpy as np
 from dotenv import load_dotenv
-from .step021_asr_whisperx import whisperx_transcribe_audio
+# from .step021_asr_whisperx import whisperx_transcribe_audio
 from .step022_asr_funasr import funasr_transcribe_audio
 from .step023_asr_higgs import higgs_transcribe_audio
 from .utils import save_wav
@@ -130,9 +130,9 @@ def transcribe_audio(method, folder, model_name: str = 'large', download_root='m
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    if method == 'WhisperX':
-        transcript = whisperx_transcribe_audio(wav_path, model_name, download_root, device, batch_size, diarization, min_speakers, max_speakers)
-    elif method == 'FunASR':
+    # if method == 'WhisperX':
+    #     transcript = whisperx_transcribe_audio(wav_path, model_name, download_root, device, batch_size, diarization, min_speakers, max_speakers)
+    if method == 'FunASR':
         transcript = funasr_transcribe_audio(wav_path, device, batch_size, diarization)
     elif method == 'Higgs':
         transcript = higgs_transcribe_audio(wav_path, device, batch_size, diarization)

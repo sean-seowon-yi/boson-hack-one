@@ -63,10 +63,6 @@ def normalize_lang(lang: str) -> str:
         'fr': 'French', 'french': 'French', 'français': 'French',
         # Spanish
         'es': 'Spanish', 'spanish': 'Spanish', 'español': 'Spanish',
-        # Polish
-        'pl': 'Polish', 'polish': 'Polish', 'polski': 'Polish',
-        # Cantonese (if supported by a backend)
-        'yue': '粤语', 'cantonese': '粤语', '粤语': '粤语',
     }
     return mapping.get(l, lang)
 
@@ -102,8 +98,8 @@ def adjust_audio_length(
     wav_path: str,
     desired_length: float,
     sample_rate: int = SR,
-    min_speed_factor: float = 0.6,
-    max_speed_factor: float = 1.1
+    min_speed_factor: float = 0.5,
+    max_speed_factor: float = 1.2
 ):
     """
     Load synthesized audio (wav or mp3), time-stretch to fit desired_length,
@@ -146,7 +142,7 @@ tts_support_languages = {
     'xtts':      ['中文', 'English', 'Japanese', 'Korean', 'French', 'Polish', 'Spanish'],
     'EdgeTTS':   ['中文', 'English', 'Japanese', 'Korean', 'French', 'Polish', 'Spanish'],
     'cosyvoice': ['中文', '粤语', 'English', 'Japanese', 'Korean', 'French'],
-    'Higgs':     ['中文', 'English', 'Japanese', 'Korean', 'French', 'Spanish', 'Polish'],
+    'Higgs':     ['中文', 'English', 'Japanese', 'Korean', 'French', 'Spanish'],
 }
 
 
@@ -249,8 +245,8 @@ def generate_wavs(method: str, folder: str, target_language: str = "Chinese", vo
 
         # Avoid overlap with next line
         if i < len(transcript) - 1:
-            next_end = float(transcript[i + 1]['end'])
-            end = min(current_time + length, next_end)
+            next_start = float(transcript[i + 1]['start'])
+            end = min(current_time + length, next_start)
         else:
             end = current_time + length
 

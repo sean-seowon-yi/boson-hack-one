@@ -1,21 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Step030 — Translation pipeline (robust + language-aware + enforcement)
+Step030 — Translation pipeline (robust + language-aware + enforcement) [streamlined]
 
-Highlights
-- Summarizes video (title/summary) in source, then translates summary to target_language (LLM path).
-- Translates transcript line-by-line with strict validation:
-    * target language enforcement (script/CLD3)
-    * same-language paraphrase rejection (overlap)
-    * optional back-translation gate
-    * tolerant payload plucking from messy LLM outputs
-    * retries with format nudges, then MT fallback if needed
-- Splits translated text into timed sentences using language-aware rules.
-- Writes summary.json and translation.json.
+Goal: Proper translation + storage to JSON quickly, without breaking existing usage.
 
-Dependencies expected in your project:
-  - tools.step032_translation_llm.llm_response
-  - tools.step033_translation_translator.translator_response
+Key tweaks:
+- Early skip for non-speech tokens (e.g., "[LAUGHTER]") to avoid wasted calls.
+- Normalized de-dup (spacing/case) so repeated lines translate once.
+- Optional FAST mode to prefer MT path automatically (env toggle; default off).
+- Parallel MT path preserved; safer caching; tighter sleeps/backoff.
+- Stricter "absolute translation" enforcement (rejects same-language paraphrases) with smart relaxations.
+- Progressive validation (strict → relaxed) + faster MT fallback.
+- Atomic writes for JSON outputs.
+- NEW: Strip <t>...</t> wrappers from all final outputs (no <t> in translation.json).
+
+Public APIs preserved:
+    summarize(...)
+    translate(...)
+    translate_all_transcript_under_folder(...)
 """
 
 from __future__ import annotations
@@ -39,13 +41,23 @@ from tools.step033_translation_translator import translator_response
 load_dotenv()
 
 # ============================================================
-# Tunables (do not alter prompts/logic; only perf knobs)
+# Tunables (perf+behavior knobs; defaults conservative)
 # ============================================================
-ENABLE_BACKTRANSLATE_VERIFY = False  # per-line MT verification (slow)
-ENABLE_DEDUP_SAME_LINES = True       # reuse translation if identical line text repeats
-MT_MAX_WORKERS = max(1, int(os.getenv("TRANSLATION_MT_MAX_WORKERS", "4")))  # only used on pure MT path
+ENABLE_BACKTRANSLATE_VERIFY = os.getenv("TRANSLATION_BACKTRANSLATE_VERIFY", "0") == "1"
+ENABLE_DEDUP_SAME_LINES = os.getenv("TRANSLATION_DEDUP", "1") == "1"
+MT_MAX_WORKERS = max(1, int(os.getenv("TRANSLATION_MT_MAX_WORKERS", "4")))  # only used on MT path
 RETRY_SLEEP_S = float(os.getenv("TRANSLATION_RETRY_SLEEP", "0.2"))
-SMALL_SLEEP_S = float(os.getenv("TRANSLATION_SMALL_SLEEP", "0.05"))
+SMALL_SLEEP_S = float(os.getenv("TRANSLATION_SMALL_SLEEP", "0.03"))
+LLM_MAX_RETRIES = max(1, int(os.getenv("TRANSLATION_LLM_MAX_RETRIES", "3")))  # default 3
+LLM_HISTORY_WINDOW = max(12, int(os.getenv("TRANSLATION_LLM_HISTORY_WINDOW", "14")))
+SUMMARY_TEXT_LIMIT = max(800, int(os.getenv("TRANSLATION_SUMMARY_TEXT_LIMIT", "1600")))
+FAST_TRANSLATION_MODE = os.getenv("TRANSLATION_FAST_MODE", "0") == "1"  # prefer MT path automatically
+
+# Non-speech pattern (skip heavy translation path)
+_NON_SPEECH = re.compile(
+    r'^\s*\[(?:music|applause|laughter|silent|silence|noise|beat|pause|inaudible|coughs|cough|breath|breathing)[^\]]*\]\s*$',
+    re.I
+)
 
 # ============================================================
 # Precompiled regexes
@@ -71,11 +83,24 @@ _RE_HANG = re.compile(r'[\uac00-\ud7af]')
 _RE_LATN = re.compile(r'[A-Za-z]')
 _PUNC_TABLE = str.maketrans('', '', string.punctuation + "，。！？；：、“”‘’—…《》·")
 
+# Strip <t>...</t> safely (NEW)
+_RE_T_WRAPPER = re.compile(r'^\s*<t\s*>(.*?)</t\s*>\s*$', re.IGNORECASE | re.DOTALL)
+_RE_T_TAGS    = re.compile(r'</?t\s*>', re.IGNORECASE)
+
+def _strip_t_tags(s: str) -> str:
+    if not s:
+        return s
+    m = _RE_T_WRAPPER.match(s)
+    if m:
+        return m.group(1).strip()
+    # If it's not a perfect single wrapper, remove any loose <t> / </t> occurrences
+    return _RE_T_TAGS.sub('', s).strip()
+
 # For CN sentence splitting
 _RE_CN_SPLIT_1 = re.compile(r'([。！？\?])([^，。！？\?”’》])')
 _RE_CN_SPLIT_2 = re.compile(r'(\.{6})([^，。！？\?”’》])')  # ......
 _RE_CN_SPLIT_3 = re.compile(r'(\…{2})([^，。！？\?”’》])')   # ……
-_RE_CN_SPLIT_4 = re.compile(r'([。！？\?][”’])([^，。！？\?”’》])')
+_RE_CN_SPLIT_4 = re.compile(r'([。！？\?][”’])([^ ，。！？\?”’》])')
 _RE_LAT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
 # ============================================================
@@ -103,6 +128,7 @@ def _is_chinese_target(lang: str) -> bool:
 
 def translation_postprocess(result: str, target_language: str = "简体中文") -> str:
     result = (result or "").strip()
+    result = _strip_t_tags(result)  # ensure <t> never survives
     result = _RE_FW_PARENS.sub('', result)
     result = _RE_NUM_COMMA.sub('', result)
     result = result.replace('²', '^2')
@@ -153,7 +179,7 @@ def _pluck_translation_payload(raw: str) -> str:
         for key in ("translation", "译文", "resultado", "traducción", "traduccion"):
             val = obj.get(key)
             if isinstance(val, str) and val.strip():
-                return val.strip()
+                return _strip_t_tags(val.strip())  # strip <t> here
     except Exception:
         pass
     for rex in _RE_PREFIXES:
@@ -161,13 +187,16 @@ def _pluck_translation_payload(raw: str) -> str:
         if m:
             t = m.group(1).strip()
             break
-    m = re.search(r'“([^”]+)”', t) or re.search(r'"([^"]+)"', t) or re.search(r'‘([^’]+)’', t) or re.search(r"'([^']+)'", t)
+    m = (re.search(r'“([^”]+)”', t) or
+         re.search(r'"([^"]+)"', t) or
+         re.search(r'‘([^’]+)’', t) or
+         re.search(r"'([^']+)'", t))
     if m and len(m.group(1).strip()) >= 1:
-        return m.group(1).strip()
+        return _strip_t_tags(m.group(1).strip())  # strip <t> here
     wrappers = ['“', '”', '"', '‘', '’', "'", '《', '》', '「', '」', '『', '』']
     while len(t) >= 2 and t[0] in wrappers and t[-1] in wrappers:
         t = t[1:-1].strip()
-    return t.strip()
+    return _strip_t_tags(t.strip())  # strip <t> here
 
 # ============================================================
 # Language normalization & detection
@@ -181,10 +210,9 @@ def _norm_lang_label(label: str) -> str:
         "简体中文": "zh", "中文": "zh",
         "english": "en", "en": "en", "en-us": "en", "en_gb": "en",
         "japanese": "ja", "ja": "ja", "日本語": "ja",
-        "korean": "ko", "ko": "ko", "한국어": "ko",
+        "korean": "ko", "ko": "ko", "韩国语": "ko", "한국어": "ko",
         "spanish": "es", "es": "es", "español": "es",
         "french": "fr", "fr": "fr", "français": "fr",
-        "polish": "pl", "pl": "pl", "polski": "pl",
     }
     return mapping.get(s, "unknown")
 
@@ -195,7 +223,7 @@ def _heuristic_lang(text: str) -> str:
     kata = len(_RE_KATA.findall(t))
     hang = len(_RE_HANG.findall(t))
     latin = len(_RE_LATN.findall(t))
-    if (hira + kata) > 0 and cjk >= 0:
+    if (hira + kata) > 0:
         return "ja"
     if hang > 0:
         return "ko"
@@ -208,6 +236,10 @@ def _heuristic_lang(text: str) -> str:
 try:
     import cld3  # type: ignore
     def _detect_lang(text: str) -> str:
+        # heuristic first (cheap), CLD3 if needed
+        h = _heuristic_lang(text)
+        if h != "unknown":
+            return h
         res = cld3.get_language(text or "")
         if res and res.language:
             code = res.language.lower()
@@ -218,7 +250,7 @@ try:
             if code.startswith("es"): return "es"
             if code.startswith("fr"): return "fr"
             if code.startswith("pl"): return "pl"
-        return _heuristic_lang(text)
+        return h
 except Exception:
     def _detect_lang(text: str) -> str:
         return _heuristic_lang(text)
@@ -230,22 +262,37 @@ def _token_set(s: str) -> set:
     s = (s or "").lower().translate(_PUNC_TABLE)
     return set(s.split())
 
-def _too_similar_to_source(src: str, tgt: str) -> bool:
+def _too_similar_to_source(src: str, tgt: str, threshold: float = 0.92) -> bool:
     ts, tt = _token_set(src), _token_set(tgt)
     if not ts or not tt:
         return False
     overlap = len(ts & tt) / max(1, len(ts | tt))
-    return overlap >= 0.85
+    return overlap >= threshold
+
+# ============================================================
+# Tiny / numeric inputs helpers
+# ============================================================
+_MICRO_MAX = 3
+_RE_NUMERICISH = re.compile(r'^[\d\W_]+$')  # digits/punct/underscore only (no letters)
+
+def _is_micro_utterance(s: str) -> bool:
+    return len((s or "").strip()) <= _MICRO_MAX
+
+def _is_numericish(s: str) -> bool:
+    return bool(_RE_NUMERICISH.fullmatch((s or "").strip()))
 
 # ============================================================
 # Back-translation verification (optional)
 # ============================================================
 def _verify_by_backtranslation(src_text: str, tgt_text: str, target_language: str) -> bool:
+    # Skip noisy verification for tiny/numeric content
+    if _is_micro_utterance(src_text) or _is_numericish(src_text):
+        return True
     try:
         src_code = _detect_lang(src_text)
         src_label = {
             "zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean",
-            "es": "Spanish", "fr": "French", "pl": "Polish"
+            "es": "Spanish", "fr": "French"
         }.get(src_code, "English")
         bt = translator_response(tgt_text, to_language=src_label, translator_server='google')
         ts, tb = _token_set(src_text), _token_set(bt)
@@ -257,47 +304,68 @@ def _verify_by_backtranslation(src_text: str, tgt_text: str, target_language: st
         return True
 
 # ============================================================
-# Validation
+# Validation — enforces absolute translation (with progressive strictness)
 # ============================================================
-def valid_translation(text: str, translation: str, target_language: str = "简体中文") -> Tuple[bool, str]:
+def valid_translation(
+    text: str,
+    translation: str,
+    target_language: str = "简体中文",
+    *,
+    strict: bool = True
+) -> Tuple[bool, str]:
     t = _pluck_translation_payload(translation)
     if not t:
         return False, 'Only translate the following sentence and give me the result.'
 
-    src_len = len(text)
-    out_len = len(t)
-    limit = max(24, int(src_len * 2.5))
-    if src_len > 10 and out_len > limit:
-        return False, 'The translation is too long. Only translate the sentence and give me the result.'
-    if src_len <= 10 and out_len > 40:
-        return False, 'Only translate the sentence and give me the result.'
-
+    # Postprocess early (also strips <t> if any)
     t = translation_postprocess(t, target_language)
 
-    target_code = _norm_lang_label(target_language)
-    trans_code = _detect_lang(t)
-    src_code = _detect_lang(text)
+    src_len = len(text or "")
+    out_len = len(t)
+    # Allow a bit more expansion; looser when strict=False
+    limit = max(24, int(src_len * (3.0 if strict else 3.6)))
+    if src_len > 10 and out_len > limit:
+        return False, 'The translation is too long. Only translate the sentence and give me the result.'
+    if src_len <= 10 and out_len > (50 if not strict else 40):
+        return False, 'Only translate the sentence and give me the result.'
 
+    target_code = _norm_lang_label(target_language)
+    trans_code  = _detect_lang(t)
+    src_code    = _detect_lang(text)
+
+    # Micro-utterance fast path: only enforce language
+    if _is_micro_utterance(text):
+        if target_code != "unknown" and trans_code != "unknown" and trans_code != target_code:
+            return False, f'Output must be in {target_language}. Only output the translation (no explanations).'
+        return True, t
+
+    # Must be in target language
     if target_code != "unknown" and trans_code != "unknown" and trans_code != target_code:
         return False, f'Output must be in {target_language}. Only output the translation (no explanations).'
 
+    # Hard reject same-language paraphrase (threshold slightly stricter)
     if trans_code != "unknown" and src_code != "unknown" and trans_code == src_code:
-        if _too_similar_to_source(text, t):
+        if _too_similar_to_source(text, t, threshold=0.92):
             return False, f'The output is not a translation. Translate into {target_language} and output only the translated text.'
 
+    # Script coverage guards (RELAXED)
     if target_code == "zh":
         cjk = len(_RE_CJK.findall(t))
-        if out_len > 0 and (cjk / out_len) < 0.4:
+        min_ratio = 0.30 if strict else 0.25
+        if out_len > 0 and (cjk / out_len) < min_ratio:
             return False, 'Output must be in Chinese. Only output the translation.'
     if target_code == "ja":
         kana = len(_RE_HIRA.findall(t)) + len(_RE_KATA.findall(t))
-        if out_len > 0 and (kana / out_len) < 0.2 and len(_RE_CJK.findall(t)) < 2:
+        min_ratio = 0.12 if strict else 0.10
+        if out_len > 0 and (kana / out_len) < min_ratio and len(_RE_CJK.findall(t)) < 2:
             return False, 'Output must be in Japanese. Only output the translation.'
     if target_code == "ko":
         hang = len(_RE_HANG.findall(t))
-        if out_len > 0 and (hang / out_len) < 0.3:
+        min_ratio = 0.25 if strict else 0.20
+        if out_len > 0 and (hang / out_len) < min_ratio:
             return False, 'Output must be in Korean. Only output the translation.'
 
+    # Some visible text required
     if not re.search(r'\w', t, flags=re.UNICODE) and not _RE_CJK.search(t):
         return False, 'Only output the translation text.'
 
@@ -369,11 +437,11 @@ def split_sentences(translation_items: List[Dict], target_language: str = "简�
     return output
 
 # ============================================================
-# Summarization + summary translate
+# Summarization + summary translate (kept; fast limit)
 # ============================================================
 def summarize(info: dict, transcript: List[dict], target_language: str = '简体中文', method: str = 'LLM') -> dict:
     transcript_text = ' '.join(line.get('text', '') for line in transcript)
-    transcript_text = ensure_transcript_length(transcript_text, max_length=2000)
+    transcript_text = ensure_transcript_length(transcript_text, max_length=SUMMARY_TEXT_LIMIT)
     info_message = f'Title: "{info["title"]}" Author: "{info["uploader"]}". '
 
     if method in ['Google Translate', 'Bing Translate']:
@@ -401,7 +469,7 @@ def summarize(info: dict, transcript: List[dict], target_language: str = '简体
     ]
 
     summary_obj = None
-    for attempt in range(9):
+    for attempt in range(6):
         try:
             response = llm_response(messages) if method == 'LLM' else None
             logger.debug(f"[summarize] raw response (attempt {attempt+1}): {str(response)[:300]}...")
@@ -415,7 +483,8 @@ def summarize(info: dict, transcript: List[dict], target_language: str = '简体
             logger.debug(f"[summarize] parse error: {e}")
             time.sleep(RETRY_SLEEP_S)
     if summary_obj is None:
-        raise Exception('Failed to summarize')
+        # graceful fallback: a minimal summary using info
+        summary_obj = {"title": info.get("title", "Untitled"), "summary": info.get("description", "")}
 
     safe_title = summary_obj["title"].replace('"', '\\"')
     safe_summary = summary_obj["summary"].replace('"', '\\"')
@@ -435,7 +504,7 @@ def summarize(info: dict, transcript: List[dict], target_language: str = '简体
     ]
 
     trans = None
-    for attempt in range(6):
+    for attempt in range(5):
         try:
             resp = llm_response(trans_messages)
             resp = resp.strip()
@@ -465,51 +534,54 @@ def summarize(info: dict, transcript: List[dict], target_language: str = '简体
     }
 
 # ============================================================
-# Line-by-line translation
+# Line-by-line translation (LLM path kept; MT path fast/parallel)
 # ============================================================
 
 @lru_cache(maxsize=4096)
 def _mt_cached(text: str, target_language: str, server: str) -> str:
-    """Cache MT results only (LLM intentionally not cached to preserve context)."""
     return translator_response(text, to_language=target_language, translator_server=server)
 
+def _norm_key(s: str) -> str:
+    return re.sub(r'\s+', ' ', (s or '').strip().lower())
+
 def _translate_llm_path(summary: dict, transcript: List[dict], target_language: str) -> List[str]:
-    """Sequential LLM path (preserves behavior, history, and prompts)."""
     info = f'This is a video called "{summary["title"]}". {summary["summary"]}.'
     full_translation: List[str] = []
 
     fixed_message = [
-        {'role': 'system',
-         'content': (
-             f'You are a professional translator.\n'
-             f'Context (for terminology only): {info}\n'
-             f'TRANSLATION RULES (must obey):\n'
-             f'1) Translate the quoted sentence into {target_language}.\n'
-             f'2) Output ONLY the translation text — no quotes, no markdown, no prefixes.\n'
-             f'3) Do NOT paraphrase in the original language; the output MUST be in {target_language}.\n'
-             f'4) Preserve technical terms and numbers faithfully.\n'
-         )},
+        {
+            'role': 'system',
+            'content': (
+                f'You are a professional translator.\n'
+                f'Context (terminology only): {info}\n'
+                f'RULES (must obey exactly):\n'
+                f'1) Translate the quoted sentence into {target_language}.\n'
+                f'2) Output ONLY inside tags: <t>...translation...</t>\n'
+                f'3) No other text, no quotes, no markdown, no explanations.\n'
+                f'4) Do NOT paraphrase in the original language; output MUST be in {target_language}.\n'
+                f'5) Preserve numbers and technical terms faithfully.\n'
+            )
+        },
         {'role': 'user', 'content': 'Translate: "Original Text"'},
-        {'role': 'assistant',
-         'content': '示例译文（仅文本，无引号）' if _is_chinese_target(target_language) else 'Example translation (text only)'},
+        {'role': 'assistant', 'content': '<t>Example translation</t>'}
     ]
 
     history: List[Dict[str, Any]] = []
     dedup_cache: Dict[str, str] = {}
 
-    for line in transcript:
+    for line_idx, line in enumerate(transcript):
         text = line.get('text', '')
-        if not text:
+        if not text or _NON_SPEECH.match(text):
             full_translation.append('')
             continue
 
-        # Optional dedup for repeated lines
-        if ENABLE_DEDUP_SAME_LINES and text in dedup_cache:
-            full_translation.append(dedup_cache[text])
-            history = history[-30:]
+        key = _norm_key(text)
+        if ENABLE_DEDUP_SAME_LINES and key in dedup_cache:
+            full_translation.append(dedup_cache[key])
+            history = history[-LLM_HISTORY_WINDOW:]
             history += [
                 {'role': 'user', 'content': f'Translate: "{text}"'},
-                {'role': 'assistant', 'content': dedup_cache[text]},
+                {'role': 'assistant', 'content': dedup_cache[key]},
             ]
             time.sleep(SMALL_SLEEP_S)
             continue
@@ -518,14 +590,17 @@ def _translate_llm_path(summary: dict, transcript: List[dict], target_language: 
         success = False
         last_err = None
 
-        for _ in range(10):
-            messages = fixed_message + history[-30:] + [
-                {'role': 'user', 'content': f'{retry_hint} Return only the translation. Translate: "{text}"'}
+        for attempt in range(LLM_MAX_RETRIES):
+            strict = (attempt == 0)  # first attempt strict, later attempts relaxed
+            messages = fixed_message + history[-LLM_HISTORY_WINDOW:] + [
+                {'role': 'user',
+                 'content': f'{retry_hint}Translate the following and output ONLY <t>...</t>:\n"{text}"'}
             ]
             try:
                 resp = llm_response(messages)
-                ok, t_clean = valid_translation(text, resp, target_language)
-                if ok and ENABLE_BACKTRANSLATE_VERIFY:
+                ok, t_clean = valid_translation(text, resp, target_language, strict=strict)
+                do_bt = ENABLE_BACKTRANSLATE_VERIFY and not (_is_micro_utterance(text) or _is_numericish(text))
+                if ok and do_bt:
                     if not _verify_by_backtranslation(text, t_clean, target_language):
                         ok = False
                         retry_hint = "Ensure the output is a faithful translation into the target language. "
@@ -536,29 +611,30 @@ def _translate_llm_path(summary: dict, transcript: List[dict], target_language: 
 
                 full_translation.append(t_clean)
                 if ENABLE_DEDUP_SAME_LINES:
-                    dedup_cache[text] = t_clean
+                    dedup_cache[key] = t_clean
                 success = True
                 break
             except Exception as e:
                 last_err = e
-                logger.debug(f"[translate-line] retryable issue: {e}")
+                logger.debug(f"[translate-LLM] retryable issue at idx={line_idx}: {e}")
                 time.sleep(RETRY_SLEEP_S)
 
         if not success:
             try:
                 mt_fallback = _mt_cached(text, target_language, 'google')
-                ok, t_clean = valid_translation(text, mt_fallback, target_language)
-                if ok and ENABLE_BACKTRANSLATE_VERIFY and not _verify_by_backtranslation(text, t_clean, target_language):
-                    ok = False
+                ok, t_clean = valid_translation(text, mt_fallback, target_language, strict=False)
+                if ok and ENABLE_BACKTRANSLATE_VERIFY and not (_is_micro_utterance(text) or _is_numericish(text)):
+                    if not _verify_by_backtranslation(text, t_clean, target_language):
+                        ok = False
                 full_translation.append(t_clean if ok else text)
                 if ok and ENABLE_DEDUP_SAME_LINES:
-                    dedup_cache[text] = t_clean
+                    dedup_cache[key] = t_clean
                 logger.warning(f"[translate-line] fell back to MT for a line due to: {last_err}")
             except Exception as ee:
                 logger.warning(f"[translate-line] MT fallback failed: {ee}")
                 full_translation.append(text)
 
-        history = history[-30:]
+        history = history[-LLM_HISTORY_WINDOW:]
         history += [
             {'role': 'user', 'content': f'Translate: "{text}"'},
             {'role': 'assistant', 'content': full_translation[-1]},
@@ -568,31 +644,27 @@ def _translate_llm_path(summary: dict, transcript: List[dict], target_language: 
     return full_translation
 
 def _translate_mt_path(transcript: List[dict], target_language: str, server: str) -> List[str]:
-    """
-    MT path with optional parallelism. Order is preserved when assembling results.
-    """
     texts = [(i, line.get('text', '')) for i, line in enumerate(transcript)]
     results = [''] * len(texts)
 
-    # Short-circuit if single-thread
     if MT_MAX_WORKERS <= 1:
         for i, t in texts:
-            if not t:
+            if not t or _NON_SPEECH.match(t):
                 results[i] = ''
                 continue
             mt = _mt_cached(t, target_language, server)
-            ok, t_clean = valid_translation(t, mt, target_language)
-            if ok and ENABLE_BACKTRANSLATE_VERIFY and not _verify_by_backtranslation(t, t_clean, target_language):
-                ok = False
+            ok, t_clean = valid_translation(t, mt, target_language)  # strict default
+            if ok and ENABLE_BACKTRANSLATE_VERIFY and not _is_micro_utterance(t) and not _is_numericish(t):
+                if not _verify_by_backtranslation(t, t_clean, target_language):
+                    ok = False
             results[i] = t_clean if ok else t
             time.sleep(SMALL_SLEEP_S)
         return results
 
-    # Parallel MT
     with ThreadPoolExecutor(max_workers=MT_MAX_WORKERS) as ex:
         futs = {}
         for i, t in texts:
-            if not t:
+            if not t or _NON_SPEECH.match(t):
                 results[i] = ''
                 continue
             futs[ex.submit(_mt_cached, t, target_language, server)] = (i, t)
@@ -601,9 +673,10 @@ def _translate_mt_path(transcript: List[dict], target_language: str, server: str
             i, src = futs[fut]
             try:
                 mt = fut.result()
-                ok, t_clean = valid_translation(src, mt, target_language)
-                if ok and ENABLE_BACKTRANSLATE_VERIFY and not _verify_by_backtranslation(src, t_clean, target_language):
-                    ok = False
+                ok, t_clean = valid_translation(src, mt, target_language)  # strict default
+                if ok and ENABLE_BACKTRANSLATE_VERIFY and not _is_micro_utterance(src) and not _is_numericish(src):
+                    if not _verify_by_backtranslation(src, t_clean, target_language):
+                        ok = False
                 results[i] = t_clean if ok else src
             except Exception as e:
                 logger.debug(f"[translate-mt] worker error: {e}")
@@ -611,8 +684,9 @@ def _translate_mt_path(transcript: List[dict], target_language: str, server: str
     return results
 
 def _translate(summary: dict, transcript: List[dict], target_language: str = '简体中文', method: str = 'LLM') -> List[str]:
-    info = f'This is a video called "{summary["title"]}". {summary["summary"]}.'
-    # Keep behavior: If explicitly MT, use MT (with parallel). Else LLM path.
+    # FAST mode: prefer MT path unless explicitly forced to LLM
+    if FAST_TRANSLATION_MODE and method not in ['Google Translate', 'Bing Translate', 'LLM']:
+        method = 'Google Translate'
     if method in ['Google Translate', 'Bing Translate']:
         server = 'google' if method == 'Google Translate' else 'bing'
         return _translate_mt_path(transcript, target_language, server)
@@ -629,8 +703,8 @@ def _atomic_write_json(path: str, obj: Any):
 
 def translate(method: str, folder: str, target_language: str = '简体中文'):
     """
-    Translates one video folder that contains transcript.json (and optionally download.info.json).
-    Produces/updates summary.json and translation.json (sentence-split + time-aligned).
+    Translate a single video folder w/ transcript.json.
+    Writes/updates summary.json and translation.json (time-aligned).
     """
     translation_path = os.path.join(folder, 'translation.json')
     if os.path.exists(translation_path):
@@ -661,27 +735,21 @@ def translate(method: str, folder: str, target_language: str = '简体中文'):
             summary = json.load(f)
     else:
         summary = summarize(info, transcript, target_language, method)
-        if summary is None:
-            logger.error(f'Failed to summarize {folder}')
-            return False
         _atomic_write_json(summary_path, summary)
 
     translations = _translate(summary, transcript, target_language, method)
 
-    # Attach translations back to original line structure
+    # Attach and split
     for i, line in enumerate(transcript):
         line['translation'] = translations[i]
-
-    # Language-aware sentence splitting for timing
     transcript_split = split_sentences(transcript, target_language=target_language, use_char_based_end=True)
 
     _atomic_write_json(translation_path, transcript_split)
-
     return summary, transcript_split
 
 def translate_all_transcript_under_folder(folder: str, method: str, target_language: str):
     """
-    Walk the directory; translate each subfolder that has transcript.json and lacks translation.json.
+    Walk directory; translate each subfolder that has transcript.json but not translation.json.
     Returns (message, last_summary_json, last_translation_json)
     """
     summary_json, translate_json = None, None

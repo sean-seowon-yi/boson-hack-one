@@ -1,4 +1,21 @@
-# tools/do_everything.py
+# -*- coding: utf-8 -*-
+"""
+tools/do_everything.py
+
+End-to-end pipeline with post-TTS Emotion control automated by
+Higgs-understanding (windowed + crossfaded), using ONLY the auto batch.
+
+UI values supported:
+  - "natural"  -> skip emotion shaping
+  - "happy"    -> treated as "auto-happy"
+  - "sad"      -> treated as "auto-sad"
+  - "angry"    -> treated as "auto-angry"
+  - "auto-*"   -> respected as-is (e.g., "auto-happy", "auto-sad", "auto-angry")
+
+Requires:
+  tools/step045_emotion_auto_batch.py
+"""
+
 import json
 import os
 import time
@@ -16,7 +33,7 @@ from .step000_video_downloader import (
 )
 from .step010_demucs_vr import separate_all_audio_under_folder, init_demucs, release_model
 from .step020_asr import transcribe_all_audio_under_folder
-from .step021_asr_whisperx import init_whisperx, init_diarize
+# from .step021_asr_whisperx import init_whisperx, init_diarize
 from .step022_asr_funasr import init_funasr
 from .step030_translation import translate_all_transcript_under_folder
 from .step040_tts import generate_all_wavs_under_folder
@@ -24,15 +41,17 @@ from .step042_tts_xtts import init_TTS
 from .step043_tts_cosyvoice import init_cosyvoice
 from .step050_synthesize_video import synthesize_all_video_under_folder
 
+# ONLY import the auto emotion batch
+from .step047_emotion_auto_batch import auto_tune_emotion_all_wavs_under_folder
+
 # Track which heavy models were initialized (process lifetime)
 models_initialized = {
     "demucs": False,
     "xtts": False,
     "cosyvoice": False,
-    "whisperx": False,
     "diarize": False,
     "funasr": False,
-    # Higgs ASR is API-based; kept out of init gating intentionally
+    # Higgs ASR/TTS are API-based; kept out of init gating intentionally
 }
 
 # === UI → internal normalization (keep EXACTLY these UI labels) ===
@@ -44,7 +63,7 @@ _UI_TO_TRANSLATION_LANG = {
     "Spanish": "Spanish",
 }
 
-# For TTS, your dropdown is: ["Chinese (中文)", "English", "Korean", "Spanish", "French"]
+# For TTS, dropdown is: ["Chinese (中文)", "English", "Korean", "Spanish", "French"]
 _UI_TO_TTS_LANG = {
     "Chinese (中文)": "中文",
     "English": "English",
@@ -88,7 +107,7 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
     futures = []
 
     try:
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             # Demucs
             if not models_initialized["demucs"]:
                 futures.append(executor.submit(init_demucs))
@@ -113,16 +132,16 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
                 logger.info("TTS 'Higgs' selected — API-based")
 
             # ASR (local initializers when applicable)
-            if asr_method == "WhisperX":
-                if not models_initialized["whisperx"]:
-                    futures.append(executor.submit(init_whisperx))
-                    models_initialized["whisperx"] = True
-                    logger.info("Initialized WhisperX")
-                if diarization and not models_initialized["diarize"]:
-                    futures.append(executor.submit(init_diarize))
-                    models_initialized["diarize"] = True
-                    logger.info("Initialized diarization")
-            elif asr_method == "FunASR":
+            # if asr_method == "WhisperX":
+            #     if not models_initialized["whisperx"]:
+            #         futures.append(executor.submit(init_whisperx))
+            #         models_initialized["whisperx"] = True
+            #         logger.info("Initialized WhisperX")
+            #     if diarization and not models_initialized["diarize"]:
+            #         futures.append(executor.submit(init_diarize))
+            #         models_initialized["diarize"] = True
+            #         logger.info("Initialized diarization")
+            if asr_method == "FunASR":
                 if not models_initialized["funasr"]:
                     futures.append(executor.submit(init_funasr))
                     models_initialized["funasr"] = True
@@ -171,6 +190,9 @@ def process_video(
     target_resolution,
     max_retries,
     progress_callback=None,
+    *,
+    emotion: str = "natural",
+    emotion_strength: float = 0.6,
 ):
     """
     Process a single video end-to-end with optional progress callback.
@@ -311,6 +333,33 @@ def process_video(
                 logger.error(error_msg)
                 return False, None, error_msg
 
+            # NEW Stage: Emotion shaping (auto via Higgs-understanding)
+            try:
+                # Map "happy"|"sad"|"angry" to "auto-happy"|... ; keep "natural" as skip
+                _emotion = (emotion or "natural").strip().lower()
+                if _emotion in ("happy", "sad", "angry"):
+                    _emotion = f"auto-{_emotion}"
+
+                if _emotion.startswith("auto"):
+                    _lang_hint = tts_target_language or "en"
+                    ok, emsg = auto_tune_emotion_all_wavs_under_folder(
+                        folder,
+                        emotion=_emotion,                     # "auto-happy"/"auto-sad"/"auto-angry"/"auto"
+                        strength=float(emotion_strength),
+                        lang_hint=_lang_hint,
+                        win_s=10.0,
+                        hop_s=9.0,
+                        xfade_ms=int(os.getenv("HIGGS_TTS_XFADE_MS", "28")),
+                        latency_budget_s=0.5,
+                        min_confidence=0.50,
+                        max_iters=2,
+                    )
+                    logger.info(f"Emotion (AUTO) shaping: {emsg}")
+                else:
+                    logger.info("Emotion preset is natural — skipping.")
+            except Exception as e:
+                logger.warning(f"Emotion shaping step failed but continuing: {e}")
+
             # Stage: Synthesis (video)
             current_stage += 1
             progress_base += stage_weight
@@ -362,7 +411,7 @@ def do_everything(
     demucs_model="htdemucs_ft",
     device="auto",
     shifts=5,
-    asr_method="Higgs",          # <-- matches your UI default
+    asr_method="Higgs",          # <-- matches UI default
     whisper_model="large",
     batch_size=32,
     diarization=False,
@@ -370,7 +419,7 @@ def do_everything(
     whisper_max_speakers=None,
     translation_method="LLM",
     translation_target_language="Simplified Chinese (简体中文)",  # <-- exact UI label
-    tts_method="Higgs",          # <-- matches your UI default
+    tts_method="Higgs",          # <-- matches UI default
     tts_target_language="Chinese (中文)",                         # <-- exact UI label
     voice="zh-CN-XiaoxiaoNeural",
     subtitles=True,
@@ -383,6 +432,9 @@ def do_everything(
     max_workers=3,
     max_retries=5,
     progress_callback=None,
+    *,
+    emotion: str = "natural",          # "natural" | "happy" | "sad" | "angry" | "auto-*" | "auto"
+    emotion_strength: float = 0.6,     # 0..1
 ):
     """
     Full pipeline entrypoint with an optional progress callback.
@@ -402,6 +454,7 @@ def do_everything(
         logger.info(f"ASR: method={asr_method}, model={whisper_model}, batch_size={batch_size}, diarization={diarization}")
         logger.info(f"Translate: method={translation_method}, target_lang={translation_target_language}")
         logger.info(f"TTS: method={tts_method}, target_lang={tts_target_language}, voice={voice}")
+        logger.info(f"Emotion(AUTO): preset={emotion}, strength={emotion_strength:.2f}")
         logger.info(f"Video compose: subtitles={subtitles}, speed={speed_up}, FPS={fps}, render_res={target_resolution}")
         logger.info("-" * 50)
 
@@ -451,6 +504,9 @@ def do_everything(
                     target_resolution,
                     max_retries,
                     progress_callback,
+                    # NEW
+                    emotion=emotion,
+                    emotion_strength=emotion_strength,
                 )
 
                 if success:
@@ -506,6 +562,9 @@ def do_everything(
                         target_resolution,
                         max_retries,
                         progress_callback,
+                        # NEW
+                        emotion=emotion,
+                        emotion_strength=emotion_strength,
                     )
 
                     if success:
