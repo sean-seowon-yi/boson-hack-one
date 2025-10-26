@@ -1,30 +1,23 @@
-# -------------------------------
-# PyTorch CPU wheels (must be first)
-# -------------------------------
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.3.1
 torchaudio==2.3.1
-# If you really need torchvision, uncomment and keep versions aligned:
-# torchvision==0.18.1
 
-# -------------------------------
-# Demucs (source separation)
-# -------------------------------
-demucs>=4.0.0
+# Coqui XTTS
+TTS        # let pip pick a py311-compatible version
+phonemizer>=3.2.1
+pydub
 
-# -------------------------------
-# Web UI / plumbing
-# -------------------------------
+# Web/UI
 gradio==5.49.1
 loguru
 python-dotenv
 dotenv
 requests
 
-# -------------------------------
-# Media / audio stack
-# -------------------------------
-librosa==0.10.2
+# Media / audio
+numpy==1.26.4
+librosa==0.10.2.post1
+scipy>=1.11
 soundfile
 audioread
 ffmpeg-python
@@ -34,33 +27,20 @@ imageio
 imageio-ffmpeg
 audiostretchy
 wget==3.2
-numpy==1.26.3
-scipy
+pyarrow
 
-# -------------------------------
 # NLP / models
-# -------------------------------
 transformers==4.39.3
 accelerate
 diffusers==0.27.2
-pyarrow
 
-# -------------------------------
-# TTS / ASR / supporting libs
-# -------------------------------
+# ASR / misc
 edge-tts
-aiohttp           # edge-tts needs this
+aiohttp
 funasr
 modelscope
 conformer==0.3.2
 WeTextProcessing==1.0.3
 HyperPyYAML==1.2.2
 
-TTS==0.22.0
-phonemizer>=3.2.1
-pydub
-
-# Optional extras you might enable later:
-# git+https://github.com/m-bain/whisperx.git
-openai
-translators
+openai>=1.3.0
