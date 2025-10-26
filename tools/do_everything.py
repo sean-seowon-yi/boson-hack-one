@@ -54,29 +54,100 @@ models_initialized = {
     # Higgs ASR/TTS are API-based; kept out of init gating intentionally
 }
 
-# === UI → internal normalization (keep EXACTLY these UI labels) ===
-_UI_TO_TRANSLATION_LANG = {
-    "Simplified Chinese (简体中文)": "简体中文",
-    "Traditional Chinese (繁体中文)": "繁体中文",
-    "English": "English",
-    "Korean": "Korean",
-    "Spanish": "Spanish",
+# ------------------------------------------------------------------------------------
+# Unified language normalization
+# Accept BOTH UI labels and codes; normalize to codes: zh-cn, zh-tw, en, ko, es, fr
+# ------------------------------------------------------------------------------------
+
+# Rich alias tables -> language code
+_TRANSLATION_ALIASES = {
+    # Simplified Chinese
+    "simplified chinese (简体中文)": "zh-cn",
+    "简体中文": "zh-cn",
+    "simplified chinese": "zh-cn",
+    "chinese (simplified)": "zh-cn",
+    "zh-cn": "zh-cn",
+    "cn": "zh-cn",
+
+    # Traditional Chinese
+    "traditional chinese (繁体中文)": "zh-tw",
+    "繁体中文": "zh-tw",
+    "traditional chinese": "zh-tw",
+    "chinese (traditional)": "zh-tw",
+    "zh-tw": "zh-tw",
+    "tw": "zh-tw",
+
+    # English
+    "english": "en",
+    "en": "en",
+
+    # Korean
+    "korean": "ko",
+    "한국어": "ko",
+    "ko": "ko",
+
+    # Spanish
+    "spanish": "es",
+    "español": "es",
+    "es": "es",
 }
 
-# For TTS, dropdown is: ["Chinese (中文)", "English", "Korean", "Spanish", "French"]
-_UI_TO_TTS_LANG = {
-    "Chinese (中文)": "中文",
-    "English": "English",
-    "Korean": "Korean",
-    "Spanish": "Spanish",
-    "French": "French",
+_TTS_ALIASES = {
+    # Chinese (generic UI label) -> use Simplified by default unless caller passed zh-tw explicitly
+    "chinese (中文)": "zh-cn",
+    "中文": "zh-cn",
+    "chinese": "zh-cn",
+    "zh": "zh-cn",
+    "zh-cn": "zh-cn",
+
+    # Traditional Chinese explicit
+    "traditional chinese": "zh-tw",
+    "繁体中文": "zh-tw",
+    "zh-tw": "zh-tw",
+
+    # English
+    "english": "en",
+    "en": "en",
+
+    # Korean
+    "korean": "ko",
+    "한국어": "ko",
+    "ko": "ko",
+
+    # Spanish
+    "spanish": "es",
+    "español": "es",
+    "es": "es",
+
+    # French
+    "french": "fr",
+    "français": "fr",
+    "fr": "fr",
 }
 
-def _norm_translation_lang(ui_label: str) -> str:
-    return _UI_TO_TRANSLATION_LANG.get(ui_label, ui_label)
+_ALLOWED_SUB_LANGS = {"zh-cn", "zh-tw", "en", "ko", "es"}
+_ALLOWED_TTS_LANGS = {"zh-cn", "zh-tw", "en", "ko", "es", "fr"}
 
-def _norm_tts_lang(ui_label: str) -> str:
-    return _UI_TO_TTS_LANG.get(ui_label, ui_label)
+def _canon(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    return str(s).strip().lower()
+
+def _norm_translation_lang(ui_label_or_code: str) -> str:
+    """Normalize subtitle/translation target to code."""
+    key = _canon(ui_label_or_code)
+    code = _TRANSLATION_ALIASES.get(key, key)
+    if code not in _ALLOWED_SUB_LANGS:
+        raise ValueError(f"Unrecognized subtitle/translation language: {ui_label_or_code}")
+    return code
+
+def _norm_tts_lang(ui_label_or_code: str) -> str:
+    """Normalize TTS target to code."""
+    key = _canon(ui_label_or_code)
+    code = _TTS_ALIASES.get(key, key)
+    if code not in _ALLOWED_TTS_LANGS:
+        raise ValueError(f"Unrecognized TTS language: {ui_label_or_code}")
+    return code
 
 def _coerce_int_or_none(x):
     if x in (None, "", "None"):
@@ -177,9 +248,9 @@ def process_video(
     whisper_min_speakers,
     whisper_max_speakers,
     translation_method,
-    translation_target_language,
+    translation_target_language,   # may be label or code
     tts_method,
-    tts_target_language,
+    tts_target_language,           # may be label or code
     voice,
     subtitles,
     speed_up,
@@ -301,8 +372,10 @@ def process_video(
                 progress_callback(progress_base, stage_name)
 
             try:
-                # Normalize translation language label
+                # Normalize subtitle/translation target (label or code -> code)
                 translation_target_language = _norm_translation_lang(translation_target_language)
+                logger.info(f"Subtitle/Translation language (code): {translation_target_language}")
+
                 msg, summary, translation = translate_all_transcript_under_folder(
                     folder, method=translation_method, target_language=translation_target_language
                 )
@@ -321,8 +394,10 @@ def process_video(
                 progress_callback(progress_base, stage_name)
 
             try:
-                # Normalize TTS language label
+                # Normalize TTS language (label or code -> code)
                 tts_target_language = _norm_tts_lang(tts_target_language)
+                logger.info(f"TTS target language (code): {tts_target_language}")
+
                 status, synth_path, _ = generate_all_wavs_under_folder(
                     folder, method=tts_method, target_language=tts_target_language, voice=voice
                 )
@@ -341,7 +416,7 @@ def process_video(
                     _emotion = f"auto-{_emotion}"
 
                 if _emotion.startswith("auto"):
-                    _lang_hint = tts_target_language or "en"
+                    _lang_hint = tts_target_language or "en"  # already normalized code
                     ok, emsg = auto_tune_emotion_all_wavs_under_folder(
                         folder,
                         emotion=_emotion,                     # "auto-happy"/"auto-sad"/"auto-angry"/"auto"
@@ -418,9 +493,9 @@ def do_everything(
     whisper_min_speakers=None,
     whisper_max_speakers=None,
     translation_method="LLM",
-    translation_target_language="Simplified Chinese (简体中文)",  # <-- exact UI label
-    tts_method="Higgs",          # <-- matches UI default
-    tts_target_language="Chinese (中文)",                         # <-- exact UI label
+    translation_target_language="zh-cn",  # default code (was UI label)
+    tts_method="Higgs",                   # <-- matches UI default
+    tts_target_language="zh-cn",          # default code (UI should override)
     voice="zh-CN-XiaoxiaoNeural",
     subtitles=True,
     speed_up=1.00,
@@ -447,13 +522,21 @@ def do_everything(
         fail_list = []
         error_details = []
 
+        # Normalize the possibly human-readable inputs to codes up-front
+        try:
+            translation_target_language = _norm_translation_lang(translation_target_language)
+            tts_target_language = _norm_tts_lang(tts_target_language)
+        except Exception as e:
+            logger.error(f"Language normalization error: {e}")
+            return f"Language normalization error: {e}", None
+
         logger.info("-" * 50)
         logger.info(f"Starting job: {url}")
         logger.info(f"Output folder={root_folder}, videos={num_videos}, download_res={resolution}")
         logger.info(f"Vocal separation: model={demucs_model}, device={device}, shifts={shifts}")
         logger.info(f"ASR: method={asr_method}, model={whisper_model}, batch_size={batch_size}, diarization={diarization}")
-        logger.info(f"Translate: method={translation_method}, target_lang={translation_target_language}")
-        logger.info(f"TTS: method={tts_method}, target_lang={tts_target_language}, voice={voice}")
+        logger.info(f"Translate: method={translation_method}, target_lang(code)={translation_target_language}")
+        logger.info(f"TTS: method={tts_method}, target_lang(code)={tts_target_language}, voice={voice}")
         logger.info(f"Emotion(AUTO): preset={emotion}, strength={emotion_strength:.2f}")
         logger.info(f"Video compose: subtitles={subtitles}, speed={speed_up}, FPS={fps}, render_res={target_resolution}")
         logger.info("-" * 50)

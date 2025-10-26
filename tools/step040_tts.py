@@ -4,7 +4,7 @@ TTS synthesis pipeline (per-line => stitched track)
 - Language-aware text preprocessing (Chinese-only normalizations gated by target language)
 - Backend dispatch to XTTS / CosyVoice / EdgeTTS / Higgs
 - Precise timing via time-stretch with bounds
-- Deterministic language support checks with name normalization
+- Deterministic language support checks with unified language codes
 """
 
 import os
@@ -38,50 +38,67 @@ _RE_CAP_SPLIT = re.compile(r'(?<!^)([A-Z])')
 _RE_ALNUM_GAP = re.compile(r'(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])')
 
 # -----------------------
-# Language normalization
+# Unified language normalization
+#   Accepts labels or codes; returns canonical codes:
+#   'zh-cn','zh-tw','en','ko','ja','es','fr','pl'
 # -----------------------
-@lru_cache(maxsize=128)
-def normalize_lang(lang: str) -> str:
-    """
-    Map many user/UI variants to the canonical labels used by tts_support_languages.
-    Falls back to the original input if not found.
-    """
-    if not lang:
-        return ''
-    l = lang.strip().lower()
-    mapping = {
-        # Chinese family
-        'zh': '中文', 'zh-cn': '中文', 'zh_cn': '中文',
-        'chinese': '中文', 'simplified chinese': '中文', '简体中文': '中文', '中文': '中文',
-        # English
-        'en': 'English', 'en-us': 'English', 'english': 'English',
-        # Japanese
-        'ja': 'Japanese', 'japanese': 'Japanese', '日本語': 'Japanese',
-        # Korean
-        'ko': 'Korean', 'korean': 'Korean', '한국어': 'Korean',
-        # French
-        'fr': 'French', 'french': 'French', 'français': 'French',
-        # Spanish
-        'es': 'Spanish', 'spanish': 'Spanish', 'español': 'Spanish',
-    }
-    return mapping.get(l, lang)
+_LANG_ALIASES = {
+    # Simplified Chinese
+    "zh-cn": "zh-cn", "zh_cn": "zh-cn", "cn": "zh-cn",
+    "chinese (中文)": "zh-cn", "chinese": "zh-cn", "中文": "zh-cn",
+    "simplified chinese (简体中文)": "zh-cn", "simplified chinese": "zh-cn", "简体中文": "zh-cn",
 
-def is_chinese(lang: str) -> bool:
-    return normalize_lang(lang) == '中文'
+    # Traditional Chinese
+    "zh-tw": "zh-tw", "zh_tw": "zh-tw", "tw": "zh-tw",
+    "traditional chinese (繁体中文)": "zh-tw", "traditional chinese": "zh-tw", "繁体中文": "zh-tw",
+
+    # English
+    "en": "en", "english": "en",
+
+    # Korean
+    "ko": "ko", "korean": "ko", "한국어": "ko",
+
+    # Japanese
+    "ja": "ja", "japanese": "ja", "日本語": "ja",
+
+    # Spanish
+    "es": "es", "spanish": "es", "español": "es",
+
+    # French
+    "fr": "fr", "french": "fr", "français": "fr",
+
+    # Polish (XTTS supports it)
+    "pl": "pl", "polish": "pl",
+}
+
+_ALLOWED_CODES = {"zh-cn", "zh-tw", "en", "ko", "ja", "es", "fr", "pl"}
+
+@lru_cache(maxsize=128)
+def normalize_lang_to_code(lang: str) -> str:
+    if not lang:
+        raise ValueError("target_language is empty/None")
+    key = str(lang).strip().lower()
+    code = _LANG_ALIASES.get(key, key)
+    if code not in _ALLOWED_CODES:
+        raise ValueError(f"Unrecognized/unsupported language: {lang} -> {code}")
+    return code
+
+def is_chinese_code(code: str) -> bool:
+    return code in ("zh-cn", "zh-tw")
 
 
 # -----------------------
 # Preprocessing
 # -----------------------
 @lru_cache(maxsize=4096)
-def preprocess_text(text: str, target_language: str) -> str:
+def preprocess_text(text: str, target_lang_code: str) -> str:
     """
     Minimal, language-aware text normalization.
-    Only apply Chinese-specific rules when target is Chinese.
+    Only apply Chinese-specific rules when target is Chinese (zh-cn/zh-tw).
     """
     t = text or ""
 
-    if is_chinese(target_language):
+    if is_chinese_code(target_lang_code):
         t = t.replace('AI', '人工智能')            # legacy preference
         t = _RE_CAP_SPLIT.sub(r' \1', t)         # split camel-case-ish caps
         t = normalizer(t)                        # Chinese text normalization
@@ -136,32 +153,62 @@ def adjust_audio_length(
 
 
 # -----------------------
-# Backend support map
+# Backend support map (codes)
 # -----------------------
 tts_support_languages = {
-    'xtts':      ['中文', 'English', 'Japanese', 'Korean', 'French', 'Polish', 'Spanish'],
-    'EdgeTTS':   ['中文', 'English', 'Japanese', 'Korean', 'French', 'Polish', 'Spanish'],
-    'cosyvoice': ['中文', '粤语', 'English', 'Japanese', 'Korean', 'French'],
-    'Higgs':     ['中文', 'English', 'Japanese', 'Korean', 'French', 'Spanish'],
+    # XTTS supports many; we keep a safe subset used in your project
+    'xtts':      {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'pl', 'es'},
+    # EdgeTTS: voices primarily determine exact locale, but these codes are fine as hints
+    'EdgeTTS':   {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'es', 'pl'},
+    # CosyVoice (common distributions): no Spanish/Polish typically
+    'cosyvoice': {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr'},
+    # Higgs (per your notes): includes Spanish, French, etc.
+    'Higgs':     {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'es'},
 }
+
+# If a backend needs a specific token instead of the unified code, adapt here.
+_BACKEND_LANG_ADAPTER = {
+    'xtts': {
+        # XTTS is happy with codes as below (common TTS community convention)
+        # Keeping identity mapping; override here if your xtts expects different tokens.
+    },
+    'EdgeTTS': {
+        # EdgeTTS typically uses the voice to pick locale, but we pass the code for completeness.
+        # Identity mapping is fine; voice wins in Edge backend.
+    },
+    'cosyvoice': {
+        # Identity for supported codes; Cantonese not used here.
+    },
+    'Higgs': {
+        # Higgs/OpenAI-compatible endpoints are fine with ISO-ish codes per your prior usage.
+    }
+}
+
+def _adapt_lang_for_backend(method: str, code: str) -> str:
+    # If adapter table has a mapping, use it; otherwise default to the code itself.
+    table = _BACKEND_LANG_ADAPTER.get(method, {})
+    return table.get(code, code)
 
 
 # -----------------------
 # Backend dispatcher
 # -----------------------
 def _synthesize_one_line(method: str, text: str, out_path: str, speaker_wav: str,
-                         target_language: str, voice: str):
+                         target_lang_code: str, voice: str):
     """
     Dispatch to the selected backend. Backends write WAV to out_path.
+    target_lang_code is one of: 'zh-cn','zh-tw','en','ko','ja','es','fr','pl'
     """
+    lang = _adapt_lang_for_backend(method, target_lang_code)
+
     if method == 'xtts':
-        xtts_tts(text, out_path, speaker_wav, target_language=target_language)
+        xtts_tts(text, out_path, speaker_wav, target_language=lang)
     elif method == 'cosyvoice':
-        cosyvoice_tts(text, out_path, speaker_wav, target_language=target_language)
+        cosyvoice_tts(text, out_path, speaker_wav, target_language=lang)
     elif method == 'EdgeTTS':
-        edge_tts(text, out_path, target_language=target_language, voice=voice)
+        edge_tts(text, out_path, target_language=lang, voice=voice)
     elif method == 'Higgs':
-        higgs_tts(text, out_path, speaker_wav, voice_type=voice, target_language=target_language)
+        higgs_tts(text, out_path, speaker_wav, voice_type=voice, target_language=lang)
     else:
         raise ValueError(f"Unknown TTS method: {method}")
 
@@ -179,20 +226,20 @@ def _atomic_write_json(path: str, obj):
 # -----------------------
 # Main per-folder synthesis
 # -----------------------
-def generate_wavs(method: str, folder: str, target_language: str = "Chinese", voice: str = 'zh-CN-XiaoxiaoNeural'):
+def generate_wavs(method: str, folder: str, target_language: str = "en", voice: str = 'zh-CN-XiaoxiaoNeural'):
     """
     Generate per-line WAVs and the combined track for one video's folder.
 
     RETURNS (strictly two values):
         (combined_wav_path, original_audio_path)
     """
-    # Normalize & validate language for this backend
-    norm_lang = normalize_lang(target_language)
-    supported = tts_support_languages.get(method, [])
-    if supported and norm_lang not in supported:
+    # Normalize & validate language for this backend (to code)
+    lang_code = normalize_lang_to_code(target_language)
+    supported = tts_support_languages.get(method, set())
+    if supported and lang_code not in supported:
         raise ValueError(
             f"TTS method '{method}' does not support target language '{target_language}' "
-            f"(normalized='{norm_lang}')"
+            f"(normalized code='{lang_code}')"
         )
 
     transcript_path = os.path.join(folder, 'translation.json')
@@ -222,14 +269,14 @@ def generate_wavs(method: str, folder: str, target_language: str = "Chinese", vo
             logger.warning(f'[TTS] Empty translation for line {i}, inserting silence.')
             text = ""
         else:
-            text = preprocess_text(raw_text, norm_lang)
+            text = preprocess_text(raw_text, lang_code)
 
         out_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
         speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
 
         # Optional idempotency: skip synthesis if file already exists & non-empty
         if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1024):
-            _synthesize_one_line(method, text, out_path, speaker_wav, norm_lang, voice)
+            _synthesize_one_line(method, text, out_path, speaker_wav, lang_code, voice)
 
         # Desired slot timing from transcript
         start = float(line['start'])
@@ -301,7 +348,7 @@ def generate_wavs(method: str, folder: str, target_language: str = "Chinese", vo
 
 
 def generate_all_wavs_under_folder(root_folder: str, method: str,
-                                   target_language: str = '中文',
+                                   target_language: str = 'en',
                                    voice: str = 'zh-CN-XiaoxiaoNeural'):
     """
     Walk `root_folder`, generate TTS where needed.
