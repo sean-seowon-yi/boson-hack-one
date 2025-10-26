@@ -1,0 +1,20 @@
+name: Sync to Hugging Face hub
+on:
+  push:
+    branches: [ main ]   # or your default branch
+  workflow_dispatch:
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 0
+      - name: Push to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add space https://huggingface.co/spaces/JackyyyWang/BosonAI_Hackathon
+          git push --force https://JackyyyWang:${HF_TOKEN}@huggingface.co/spaces/JackyyyWang/BosonAI_Hackathon HEAD:main
