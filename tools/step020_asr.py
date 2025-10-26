@@ -4,7 +4,6 @@ import torch
 import numpy as np
 from dotenv import load_dotenv
 # from .step021_asr_whisperx import whisperx_transcribe_audio
-from .step022_asr_funasr import funasr_transcribe_audio
 from .step023_asr_higgs import higgs_transcribe_audio
 from .utils import save_wav
 import json

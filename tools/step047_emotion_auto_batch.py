@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 tools/step047_emotion_auto_batch.py
-Batch tuner that uses NUCLEAR emotion shaping by default.
+Batch tuner that uses the rate-safe, extra-obvious DSP (step045).
 """
 from __future__ import annotations
 import os, glob
@@ -55,16 +55,15 @@ def _parse_auto_preset(emotion: str) -> Optional[str]:
 def auto_tune_emotion_all_wavs_under_folder(
     folder: str,
     emotion: str = "auto-angry",
-    strength: float = 0.9,
+    strength: float = 0.85,
     lang_hint: str = "en",
     win_s: float = 10.0,
     hop_s: float = 9.0,
     xfade_ms: int = 28,
-    latency_budget_s: float = 1.2,
+    latency_budget_s: float = 1.0,
     min_confidence: float = 0.40,
-    max_iters: int = 8,
+    max_iters: int = 6,
     exaggerate: bool = True,
-    nuclear: bool = True,   # NUCLEAR by default
 ) -> tuple[bool, str]:
     target = _parse_auto_preset(emotion)
     if target is None: return False, f"Emotion '{emotion}' is not an auto-* mode"
@@ -107,7 +106,6 @@ def auto_tune_emotion_all_wavs_under_folder(
                     min_confidence=min_confidence,
                     max_iters=max_iters,
                     exaggerate=exaggerate,
-                    nuclear=nuclear,
                 )
                 final = meta.get("final", {}) or {}
                 v = float(final.get("valence", 0.0) or 0.0)
@@ -116,7 +114,7 @@ def auto_tune_emotion_all_wavs_under_folder(
 
                 logger.debug(
                     f"[EmotionAutoBatch] {os.path.basename(p)} [{i0/sr:.2f}-{i1/sr:.2f}s] "
-                    f"target={target}{' EXAG' if exaggerate else ''}{' NUC' if nuclear else ''} → "
+                    f"target={target}{' EXAG' if exaggerate else ''} → "
                     f"v={v:+.2f} a={a:+.2f} conf={cf:.2f}"
                 )
 
@@ -127,11 +125,11 @@ def auto_tune_emotion_all_wavs_under_folder(
             processed += 1
             logger.info(
                 f"[EmotionAutoBatch] Auto-tuned {target} ({strength:.2f}) "
-                f"{'[EXAG]' if exaggerate else ''}{'[NUC]' if nuclear else ''} → "
+                f"{'[EXAG]' if exaggerate else ''} → "
                 f"{os.path.basename(p)} | final: v={last_v:+.2f} a={last_a:+.2f} conf={last_cf:.2f}"
             )
 
         except Exception as e:
             logger.exception(f"[EmotionAutoBatch] Failed '{p}': {e}")
 
-    return True, f"Auto-tuned {processed} file(s) to {target} ({strength:.2f}) [NUCLEAR]."
+    return True, f"Auto-tuned {processed} file(s) to {target} ({strength:.2f}) with rate clamped."
