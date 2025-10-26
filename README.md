@@ -131,7 +131,7 @@ python webui.py
 **Qwen** is a localized large language model that supports multi-language translation. Although its performance may not match OpenAI's top models, its open-source nature and local execution make it a cost-effective option. Qwen is capable of handling text translations across various languages and serves as a powerful open-source alternative. 
 
 
-
+### Key Features
 1. **Multi-language support**: Handles speech synthesis tasks in various languages.
 2. **Multi-style speech synthesis**: Controls the emotion and tone of speech through commands.
 3. **Streaming inference support**: Future plans include real-time streaming inference support.
