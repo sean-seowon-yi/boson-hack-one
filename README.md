@@ -29,14 +29,14 @@ Follow the steps below to install.
 
 ### 1. Clone the Repository
 
-First, clone the `boson-hack-one` repository to your local machine and initialize submodules.
+First, clone the `pentalingual` repository to your local machine and initialize submodules.
 
 ```bash
 # Clone the project to your local machine
-git clone https://github.com/sean-seowon-yi/boson-hack-one
+git clone https://github.com/sean-seowon-yi/pentalingual
 
 # Navigate to the project directory
-cd boson-hack-one
+cd pentalingual
 
 # Initialize and update submodule
 git submodule update --init --recursive
@@ -48,13 +48,13 @@ Before proceeding, please create a new Python environment and install the requir
 
 ```bash
 # Create a conda environment named 'boson_hack' and specify Python version 3.10
-conda create -n boson_hack python=3.10 -y
+conda create -n pentalingual python=3.10 -y
 
 # Activate the newly created environment
-conda activate boson_hack
+conda activate pentalingual
 
 # Navigate to the project directory
-cd boson-hack-one/
+cd pentalingual/
 
 # Install the ffmpeg tool
 # Install ffmpeg using conda
