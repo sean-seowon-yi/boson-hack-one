@@ -1,47 +1,62 @@
-# PyTorch and its dependencies
-# These libraries include PyTorch and its related packages, supporting CUDA 11.8.
-# --extra-index-url https://download.pytorch.org/whl/cu118
-torch
-torchvision
-torchaudio
+# -------------------------------
+# PyTorch CPU wheels (must be first)
+# -------------------------------
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.3.1
+torchaudio==2.3.1
+# If you really need torchvision, uncomment and keep versions aligned:
+# torchvision==0.18.1
 
-numpy==1.26.3
-transformers==4.39.3
-translators
-edge-tts
-gradio
+# -------------------------------
+# Demucs (source separation)
+# -------------------------------
+demucs>=4.0.0
+
+# -------------------------------
+# Web UI / plumbing
+# -------------------------------
+gradio==5.49.1
 loguru
-yt-dlp
-scipy
 python-dotenv
-openai
-audiostretchy
-modelscope
-
-# ASR
-# git+https://github.com/m-bain/whisperx.git
-# git+https://github.com/facebookresearch/demucs#egg=demucs
-funasr
-
-# googletrans
-
-# Qwen
-accelerate
-
-# CoxyVoice
-HyperPyYAML==1.2.2
-librosa==0.10.2
-WeTextProcessing==1.0.3
-wget==3.2
-# openai-whisper==20231117
-modelscope
-diffusers==0.27.2
-gdown==5.1.0
-pyarrow
-conformer==0.3.2
-lightning==2.2.4
-requests
 dotenv
-loguru
+requests
+
+# -------------------------------
+# Media / audio stack
+# -------------------------------
+librosa==0.10.2
+soundfile
+audioread
+ffmpeg-python
+yt-dlp
 moviepy
-# ctranslate2==3.24.0
+imageio
+imageio-ffmpeg
+audiostretchy
+wget==3.2
+numpy==1.26.3
+scipy
+
+# -------------------------------
+# NLP / models
+# -------------------------------
+transformers==4.39.3
+accelerate
+diffusers==0.27.2
+pyarrow
+
+# -------------------------------
+# TTS / ASR / supporting libs
+# -------------------------------
+edge-tts
+aiohttp           # edge-tts needs this
+funasr
+modelscope
+conformer==0.3.2
+WeTextProcessing==1.0.3
+HyperPyYAML==1.2.2
+
+# Optional extras you might enable later:
+# git+https://github.com/m-bain/whisperx.git
+# openai
+# translators
