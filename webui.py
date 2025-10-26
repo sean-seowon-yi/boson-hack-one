@@ -88,12 +88,11 @@ full_auto_interface = gr.Interface(
     allow_flagging="never",
 )
 
-app = full_auto_interface
+demo = full_auto_interface 
+
+
+demo = demo.queue(concurrency_count=1, max_size=8)
+
 
 if __name__ == "__main__":
-    app.launch(
-        server_name="127.0.0.1",
-        server_port=6006,
-        share=True,
-        inbrowser=True,
-    )
+    demo.launch()  
