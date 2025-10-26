@@ -1,7 +1,7 @@
 name: Sync to Hugging Face hub
 on:
   push:
-    branches: [ main ]   # or your default branch
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -12,9 +12,15 @@ jobs:
         with:
           lfs: true
           fetch-depth: 0
+      - name: Install Git LFS
+        run: |
+          git lfs install
+          git lfs fetch --all
+          git lfs status
       - name: Push to HF Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           git remote add space https://huggingface.co/spaces/JackyyyWang/BosonAI_Hackathon
+          # force push current HEAD to main on the Space
           git push --force https://JackyyyWang:${HF_TOKEN}@huggingface.co/spaces/JackyyyWang/BosonAI_Hackathon HEAD:main
