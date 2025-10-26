@@ -1,29 +1,15 @@
-# -------------------------------
-# PyTorch CPU wheels (must be first)
-# -------------------------------
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.3.1
 torchaudio==2.3.1
-# If you really need torchvision, uncomment and keep versions aligned:
-# torchvision==0.18.1
+# torchvision==0.18.1   # only if you really need it
 
-# -------------------------------
-# Demucs (source separation)
-# -------------------------------
 demucs>=4.0.0
-
-# -------------------------------
-# Web UI / plumbing
-# -------------------------------
 gradio==5.49.1
 loguru
 python-dotenv
 dotenv
 requests
 
-# -------------------------------
-# Media / audio stack
-# -------------------------------
 librosa==0.10.2
 soundfile
 audioread
@@ -37,26 +23,18 @@ wget==3.2
 numpy==1.26.3
 scipy
 
-# -------------------------------
-# NLP / models
-# -------------------------------
 transformers==4.39.3
 accelerate
 diffusers==0.27.2
 pyarrow
 
-# -------------------------------
-# TTS / ASR / supporting libs
-# -------------------------------
 edge-tts
-aiohttp           # edge-tts needs this
+aiohttp
 funasr
 modelscope
 conformer==0.3.2
 WeTextProcessing==1.0.3
 HyperPyYAML==1.2.2
 
-# Optional extras you might enable later:
-# git+https://github.com/m-bain/whisperx.git
-# openai
-# translators
+# NEW: WhisperX from GitHub
+git+https://github.com/m-bain/whisperx.git
