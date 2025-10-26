@@ -130,6 +130,11 @@ python webui.py
 
 **Qwen** is a localized large language model that supports multi-language translation. Although its performance may not match OpenAI's top models, its open-source nature and local execution make it a cost-effective option. Qwen is capable of handling text translations across various languages and serves as a powerful open-source alternative. 
 
+### Text to Speech
+
+#### XTTS
+
+**XTTS** (Cross-lingual Text-to-Speech) is an advanced multilingual, multi-speaker TTS model designed to generate natural, expressive, and high-quality speech across a wide range of languages and accents. Developed as part of the Coqui TTS ecosystem, XTTS builds upon the Tacotron and VITS architectures, integrating a cross-lingual transfer mechanism that allows it to reproduce speaker identity and emotional tone even in languages the speaker never explicitly recorded. The model supports zero-shot voice cloning — users can synthesize speech in any supported language using only a short reference audio clip of the target speaker. 
 
 ### Key Features
 1. **Multi-language support**: Handles speech synthesis tasks in various languages.
