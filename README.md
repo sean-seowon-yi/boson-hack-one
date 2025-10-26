@@ -1,3 +1,16 @@
+---
+title: BosonAI Hackathon
+emoji: 🏃
+colorFrom: pink
+colorTo: indigo
+sdk: gradio
+sdk_version: 5.49.1
+app_file: app.py
+pinned: false
+license: apache-2.0
+short_description: BosonAI_Hackathon
+---
+
 # Intelligent Multi-language AI Dubbing/Translation Tool - Linly-Dubbing — "AI Empowerment, Language Without Borders"
 
 <div align="center">
