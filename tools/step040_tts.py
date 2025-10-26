@@ -5,6 +5,7 @@ TTS synthesis pipeline (per-line => stitched track)
 - Backend dispatch to XTTS / CosyVoice / EdgeTTS / Higgs
 - Precise timing via time-stretch with bounds
 - Deterministic language support checks with unified language codes
+- NEW: Optional per-line emotion injection (post-stretch, pre-concatenate)
 """
 
 import os
@@ -23,8 +24,11 @@ from audiostretchy.stretch import stretch_audio
 from .step042_tts_xtts import tts as xtts_tts
 from .step043_tts_cosyvoice import tts as cosyvoice_tts
 from .step044_tts_edge_tts import tts as edge_tts
-# NEW: Higgs/Boson TTS (OpenAI-compatible)
-from .step041_tts_higgs import tts as higgs_tts  # ensure this file exists
+# Higgs/Boson TTS (OpenAI-compatible)
+from .step041_tts_higgs import tts as higgs_tts
+
+# NEW: rate-safe emotion tuning
+from .step045_emotion import auto_tune_emotion
 
 # -----------------------
 # Constants / globals
@@ -67,7 +71,7 @@ _LANG_ALIASES = {
     # French
     "fr": "fr", "french": "fr", "français": "fr",
 
-    # Polish (XTTS supports it)
+    # Polish
     "pl": "pl", "polish": "pl",
 }
 
@@ -156,38 +160,43 @@ def adjust_audio_length(
 # Backend support map (codes)
 # -----------------------
 tts_support_languages = {
-    # XTTS supports many; we keep a safe subset used in your project
     'xtts':      {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'pl', 'es'},
-    # EdgeTTS: voices primarily determine exact locale, but these codes are fine as hints
     'EdgeTTS':   {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'es', 'pl'},
-    # CosyVoice (common distributions): no Spanish/Polish typically
     'cosyvoice': {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr'},
-    # Higgs (per your notes): includes Spanish, French, etc.
     'Higgs':     {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'es'},
 }
 
-# If a backend needs a specific token instead of the unified code, adapt here.
 _BACKEND_LANG_ADAPTER = {
-    'xtts': {
-        # XTTS is happy with codes as below (common TTS community convention)
-        # Keeping identity mapping; override here if your xtts expects different tokens.
-    },
-    'EdgeTTS': {
-        # EdgeTTS typically uses the voice to pick locale, but we pass the code for completeness.
-        # Identity mapping is fine; voice wins in Edge backend.
-    },
-    'cosyvoice': {
-        # Identity for supported codes; Cantonese not used here.
-    },
-    'Higgs': {
-        # Higgs/OpenAI-compatible endpoints are fine with ISO-ish codes per your prior usage.
-    }
+    'xtts': {},
+    'EdgeTTS': {},
+    'cosyvoice': {},
+    'Higgs': {},
 }
 
 def _adapt_lang_for_backend(method: str, code: str) -> str:
-    # If adapter table has a mapping, use it; otherwise default to the code itself.
     table = _BACKEND_LANG_ADAPTER.get(method, {})
     return table.get(code, code)
+
+# -----------------------
+# Emotion helpers
+# -----------------------
+def _parse_emotion_mode(emotion: str | None) -> str | None:
+    """
+    Returns 'happy'|'sad'|'angry' or None (for natural/disabled).
+    Accepts: 'natural' -> None; 'auto' -> 'happy' default;
+             'auto-happy'|'auto-sad'|'auto-angry' -> mapped;
+             'happy'|'sad'|'angry' -> same.
+    """
+    if not emotion:
+        return None
+    e = str(emotion).strip().lower()
+    if e == "natural":
+        return None
+    if e == "auto":
+        return "happy"
+    if e.startswith("auto-"):
+        e = e.split("-", 1)[1].strip()
+    return e if e in {"happy", "sad", "angry"} else None
 
 
 # -----------------------
@@ -226,7 +235,9 @@ def _atomic_write_json(path: str, obj):
 # -----------------------
 # Main per-folder synthesis
 # -----------------------
-def generate_wavs(method: str, folder: str, target_language: str = "en", voice: str = 'zh-CN-XiaoxiaoNeural'):
+def generate_wavs(method: str, folder: str, target_language: str = "en",
+                  voice: str = 'zh-CN-XiaoxiaoNeural',
+                  *, emotion: str | None = None, emotion_strength: float = 0.6):
     """
     Generate per-line WAVs and the combined track for one video's folder.
 
@@ -241,6 +252,8 @@ def generate_wavs(method: str, folder: str, target_language: str = "en", voice: 
             f"TTS method '{method}' does not support target language '{target_language}' "
             f"(normalized code='{lang_code}')"
         )
+
+    emotion_mode = _parse_emotion_mode(emotion)  # 'happy'|'sad'|'angry' or None
 
     transcript_path = os.path.join(folder, 'translation.json')
     if not os.path.exists(transcript_path):
@@ -274,7 +287,7 @@ def generate_wavs(method: str, folder: str, target_language: str = "en", voice: 
         out_path = os.path.join(output_folder, f'{str(i).zfill(4)}.wav')
         speaker_wav = os.path.join(folder, 'SPEAKER', f'{speaker}.wav')
 
-        # Optional idempotency: skip synthesis if file already exists & non-empty
+        # Idempotency: synthesize clip if missing
         if not (os.path.exists(out_path) and os.path.getsize(out_path) > 1024):
             _synthesize_one_line(method, text, out_path, speaker_wav, lang_code, voice)
 
@@ -297,8 +310,35 @@ def generate_wavs(method: str, folder: str, target_language: str = "en", voice: 
         else:
             end = current_time + length
 
-        # Stretch/crop synthesized line to fit the slot
+        # Stretch to slot
         wav_seg, adj_len = adjust_audio_length(out_path, end - current_time, sample_rate=SR)
+
+        # OPTIONAL: inject emotion on the slot-aligned segment (rate-safe)
+        if emotion_mode:
+            tuned, meta = auto_tune_emotion(
+                wav_seg, SR,
+                target_preset=emotion_mode,
+                strength=float(emotion_strength),
+                lang=lang_code,
+                sentence_times=None,
+                latency_budget_s=0.5,
+                min_confidence=0.50,
+                max_iters=2,
+                exaggerate=True,
+            )
+            wav_seg = tuned.astype(np.float32)
+
+            # Overwrite the on-disk *_adjusted.wav so artifacts on disk are emotionalized
+            adjusted_path = (out_path[:-4] + "_adjusted.wav") if out_path.endswith(".wav") else (out_path + "_adjusted.wav")
+            need = int(adj_len * SR)
+            if need > 0:
+                if len(wav_seg) < need:
+                    wav_seg = np.pad(wav_seg, (0, need - len(wav_seg)), mode='constant')
+                else:
+                    wav_seg = wav_seg[:need]
+            save_wav(wav_seg, adjusted_path)
+
+        # Use (possibly tuned) segment for the master build
         chunks.append(wav_seg.astype(np.float32))
 
         # Write back updated timing
@@ -340,6 +380,13 @@ def generate_wavs(method: str, folder: str, target_language: str = "en", voice: 
 
     combined = full_wav + instruments_wav
     combined_path = os.path.join(folder, 'audio_combined.wav')
+
+    # Also write an explicit emotion-combined file when emotion is active (optional belt)
+    if emotion_mode:
+        combined_emotion_path = os.path.join(folder, 'audio_combined_emotion.wav')
+        save_wav_norm(combined, combined_emotion_path)
+        logger.info(f'[TTS] Generated {combined_emotion_path}')
+
     save_wav_norm(combined, combined_path)
     logger.info(f'[TTS] Generated {combined_path}')
 
@@ -349,7 +396,8 @@ def generate_wavs(method: str, folder: str, target_language: str = "en", voice: 
 
 def generate_all_wavs_under_folder(root_folder: str, method: str,
                                    target_language: str = 'en',
-                                   voice: str = 'zh-CN-XiaoxiaoNeural'):
+                                   voice: str = 'zh-CN-XiaoxiaoNeural',
+                                   *, emotion: str | None = None, emotion_strength: float = 0.6):
     """
     Walk `root_folder`, generate TTS where needed.
 
@@ -359,8 +407,10 @@ def generate_all_wavs_under_folder(root_folder: str, method: str,
     wav_combined, wav_ori = None, None
     for root, dirs, files in os.walk(root_folder):
         if 'translation.json' in files and 'audio_combined.wav' not in files:
-            wav_combined, wav_ori = generate_wavs(method, root, target_language, voice)
+            wav_combined, wav_ori = generate_wavs(method, root, target_language, voice,
+                                                  emotion=emotion, emotion_strength=emotion_strength)
         elif 'audio_combined.wav' in files:
+            # Already generated — keep behavior
             wav_combined = os.path.join(root, 'audio_combined.wav')
             wav_ori = os.path.join(root, 'audio.wav')
             logger.info(f'[TTS] Wavs already generated in {root}')
@@ -369,7 +419,4 @@ def generate_all_wavs_under_folder(root_folder: str, method: str,
 
 
 if __name__ == '__main__':
-    # Example quick test
-    # folder = r'videos/ExampleUploader/20240805 Demo Video'
-    # print(generate_wavs('xtts', folder))
     pass

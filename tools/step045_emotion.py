@@ -1,28 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 step045_emotion.py
-Rate-SAFE, ultra-obvious DSP emotion shaping (no TTS prompt changes).
-- Angry: lean low end, huge bite, bright, hard compression, gritty saturation, consonant snap, tense micro-jitter
-- Happy: bright, sparkly, buoyant with parallel (upward) compression, mild grit
-- Sad: darker/warmer, slower *feel* via pauses & HF roll-off, relaxed dynamics
-- Speaking RATE is hard-limited to small changes (<= ±0.08), per request.
+Rate-SAFE, obvious DSP emotion shaping (no TTS prompt changes).
 
-Public API (unchanged):
-    apply_emotion(wav, sr, preset="angry", strength=0.85, lang="en",
-                  sentence_times=None, exaggerate=True) -> np.ndarray
-    auto_tune_emotion(wav, sr, target_preset="angry", strength=0.85, lang="en",
-                      sentence_times=None, latency_budget_s=1.0, min_confidence=0.35,
-                      max_iters=6, exaggerate=True)
+Additions:
+- Loudness normalizer (LUFS-like, K-weighted) with gate & max gain
+- Soft limiter after normalization to avoid clipping
 """
 
 from __future__ import annotations
+import os
 import time
 from typing import List, Optional, Tuple
 
 import numpy as np
 import librosa
 from loguru import logger
-from scipy.signal import lfilter, butter
+from scipy.signal import lfilter, butter, sosfiltfilt
 
 from .step046_higgs_understanding import score_emotion, EmotionScore
 
@@ -30,33 +24,35 @@ from .step046_higgs_understanding import score_emotion, EmotionScore
 # Strong targets with MINIMAL rate changes
 # ---------------------------------------------------------
 _BASE_PRESETS = {
-    "neutral": dict(pitch_st=0.0,  rate= 0.00, shelf_db= 0.0, mid_db= 0.0, comp_ratio=1.2, pause_scale=1.00, drive=0.00),
-    "happy":   dict(pitch_st=+1.8, rate=+0.06, shelf_db=+8.0, mid_db=+3.0, comp_ratio=2.2, pause_scale=0.92, drive=0.18),
-    "sad":     dict(pitch_st=-1.8, rate=-0.05, shelf_db=-6.0, mid_db=-2.0, comp_ratio=1.3, pause_scale=1.40, drive=0.00),
-    "angry":   dict(pitch_st=+2.4, rate=+0.05, shelf_db=+11.0, mid_db=+9.0, comp_ratio=8.0, pause_scale=0.82, drive=0.55),
+    "neutral": dict(pitch_st=0.0,  rate= 0.00, shelf_db= 0.0,  mid_db= 0.0,  comp_ratio=1.25, pause_scale=1.00, drive=0.00),
+    "happy":   dict(pitch_st=+2.0, rate=+0.06, shelf_db=+10.0, mid_db=+4.0,  comp_ratio=2.6,  pause_scale=0.90, drive=0.22),
+    "sad":     dict(pitch_st=-2.0, rate=-0.06, shelf_db=-9.0,  mid_db=-2.4, comp_ratio=1.45, pause_scale=1.50, drive=0.00),
+    "angry":   dict(pitch_st=+2.6, rate=+0.06, shelf_db=+12.0, mid_db=+10.0, comp_ratio=9.0,  pause_scale=0.80, drive=0.60),
 }
 
-# Hard clamps (keep rate small)
+# Hard clamps
 _LIMITS = {
-    "neutral": dict(pitch_st=2.5, rate=0.08, shelf_db=12.0, mid_db=10.0, comp_ratio=8.0, drive=0.50),
-    "happy":   dict(pitch_st=3.0, rate=0.08, shelf_db=12.0, mid_db=10.0, comp_ratio=8.0, drive=0.45),
-    "sad":     dict(pitch_st=3.0, rate=0.08, shelf_db=12.0, mid_db=10.0, comp_ratio=6.0, drive=0.35),
-    "angry":   dict(pitch_st=3.0, rate=0.08, shelf_db=13.5, mid_db=12.0, comp_ratio=12.0, drive=0.85),
+    "neutral": dict(pitch_st=3.0, rate=0.08, shelf_db=12.0, mid_db=10.0, comp_ratio=9.0,  drive=0.55),
+    "happy":   dict(pitch_st=3.0, rate=0.08, shelf_db=12.0, mid_db=10.0, comp_ratio=8.0,  drive=0.30),
+    "sad":     dict(pitch_st=3.0, rate=0.08, shelf_db=12.0, mid_db=10.0, comp_ratio=1.8,  drive=0.20),
+    "angry":   dict(pitch_st=3.0, rate=0.08, shelf_db=13.5, mid_db=12.0, comp_ratio=12.0, drive=0.70),
 }
 _MAX_PITCH_ST_GLOBAL  = 3.0
-_MAX_RATE_FRAC_GLOBAL = 0.08   # <= 8% speed change total
+_MAX_RATE_FRAC_GLOBAL = 0.08
 
-# Guidance targets (Higgs VA)
-_VA_TARGETS = {
-    "neutral": ( 0.00, 0.00),
-    "happy":   (+0.60, +0.60),
-    "sad":     (-0.60, -0.50),
-    "angry":   (-0.40, +0.88),
-}
+# Target LUFS (configurable via env); per-clip normalizer
+_TARGET_LUFS = float(os.getenv("EMO_TARGET_LUFS", "-16.0"))
+_MAX_MAKEUP_DB = float(os.getenv("EMO_MAX_MAKEUP_DB", "9.0"))
+_GATE_LUFS = float(os.getenv("EMO_GATE_LUFS", "-45.0"))
 
-# ---------- DSP helpers ----------
+# ---------- helpers ----------
+
 def _db_to_lin(db: float) -> float:
     return float(10 ** (db / 20.0))
+
+def _lin_to_db(x: float) -> float:
+    x = max(x, 1e-12)
+    return 20.0 * np.log10(x)
 
 def _soft_compress(y: np.ndarray, ratio: float = 1.0) -> np.ndarray:
     y = np.asarray(y, dtype=np.float32)
@@ -66,14 +62,13 @@ def _soft_compress(y: np.ndarray, ratio: float = 1.0) -> np.ndarray:
     return (y * gain).astype(np.float32)
 
 def _parallel_compress(y: np.ndarray, ratio: float = 2.0, mix: float = 0.35) -> np.ndarray:
-    """Upward(ish) compression via parallel mix of a compressed copy."""
     if ratio <= 1.0 or mix <= 1e-4: return y
     c = _soft_compress(y, ratio=ratio)
     m = float(np.clip(mix, 0.0, 0.9))
     out = (1.0 - m) * y + m * c
     return np.clip(out, -1.0, 1.0).astype(np.float32)
 
-def _limiter(y: np.ndarray, thr_db: float = -1.0) -> np.ndarray:
+def _limiter_soft(y: np.ndarray, thr_db: float = -1.5) -> np.ndarray:
     thr = _db_to_lin(thr_db)
     peak = float(np.max(np.abs(y)) + 1e-8)
     if peak <= thr: return y
@@ -107,84 +102,35 @@ def _peaking_eq(y: np.ndarray, sr: int, gain_db: float, f0: float, Q: float) -> 
     b, a = _biquad_peak(sr, f0=f0, Q=Q, gain_db=gain_db)
     return lfilter(b, a, y).astype(np.float32)
 
-def _shelf(y: np.ndarray, sr: int, gain_db: float, cutoff: float, high: bool) -> np.ndarray:
-    if abs(gain_db) < 1e-3: return y
-    A = 10 ** (gain_db / 40.0)
-    w0 = 2*np.pi*cutoff/float(sr)
-    alpha = np.sin(w0)/2.0
-    cosw0 = np.cos(w0)
-    if high:
-        b0 =    A*((A+1)+(A-1)*cosw0+2*np.sqrt(A)*alpha)
-        b1 = -2*A*((A-1)+(A+1)*cosw0)
-        b2 =    A*((A+1)+(A-1)*cosw0-2*np.sqrt(A)*alpha)
-        a0 =        (A+1)-(A-1)*cosw0+2*np.sqrt(A)*alpha
-        a1 =  2*((A-1)-(A+1)*cosw0)
-        a2 =        (A+1)-(A-1)*cosw0-2*np.sqrt(A)*alpha
-    else:
-        b0 =    A*((A+1)-(A-1)*cosw0+2*np.sqrt(A)*alpha)
-        b1 =  2*A*((A-1)-(A+1)*cosw0)
-        b2 =    A*((A+1)-(A-1)*cosw0-2*np.sqrt(A)*alpha)
-        a0 =        (A+1)+(A-1)*cosw0+2*np.sqrt(A)*alpha
-        a1 = -2*((A-1)+(A+1)*cosw0)
-        a2 =        (A+1)+(A-1)*cosw0-2*np.sqrt(A)*alpha
-    if abs(a0) < 1e-12: return y
-    b = np.array([b0,b1,b2],dtype=np.float64)/a0
-    a = np.array([1.0,a1/a0,a2/a0],dtype=np.float64)
-    return lfilter(b,a,y).astype(np.float32)
-
-def _high_shelf(y, sr, gain_db, cutoff): return _shelf(y,sr,gain_db,cutoff,True)
-def _low_shelf(y,  sr, gain_db, cutoff): return _shelf(y,sr,gain_db,cutoff,False)
-
-def _hp(y: np.ndarray, sr: int, cutoff: float, order: int = 2) -> np.ndarray:
-    if cutoff <= 0.0: return y
-    b, a = butter(order, cutoff / (0.5 * sr), btype='high', output='ba')
-    return lfilter(b, a, y).astype(np.float32)
-
-def _lp(y: np.ndarray, sr: int, cutoff: float, order: int = 2) -> np.ndarray:
-    if cutoff <= 0.0: return y
-    b, a = butter(order, cutoff / (0.5 * sr), btype='low', output='ba')
-    return lfilter(b, a, y).astype(np.float32)
+# ---- MISSING IN ORIGINAL: de-esser & pause stretcher ----
 
 def _de_ess(y: np.ndarray, sr: int, center: float = 7200.0, Q: float = 3.0, depth_db: float = -7.0) -> np.ndarray:
+    """Simple static de-esser via narrow peaking cut."""
     return _peaking_eq(y, sr, gain_db=depth_db, f0=center, Q=Q)
 
-def _transient_snap(y: np.ndarray, amount: float = 0.32) -> np.ndarray:
-    if amount <= 1e-4: return y
-    yy = np.abs(y) - librosa.effects.preemphasis(np.abs(y), coef=0.85)
-    yy = np.clip(yy, 0.0, 1.0).astype(np.float32)
-    mix = float(np.clip(amount, 0.0, 0.6))
-    return np.clip((1.0 - mix) * y + mix * yy * np.sign(y), -1.0, 1.0).astype(np.float32)
-
-def _micro_jitter(y: np.ndarray, sr: int, pitch_cents: float = 12.0, rate_ppm: float = 900.0) -> np.ndarray:
-    if len(y) < sr//3: return y
-    t = np.linspace(0, len(y)/sr, num=len(y), dtype=np.float32, endpoint=False)
-    p_lfo = 2*np.pi*0.9*t
-    r_lfo = 2*np.pi*0.7*t
-    n_steps = (pitch_cents / 100.0) * np.sin(p_lfo)
-    try:
-        yp = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps.astype(np.float32))
-    except Exception:
-        yp = y
-    rate = 1.0 + (rate_ppm / 1_000_000.0) * np.sin(r_lfo)
-    try:
-        idx = np.cumsum(rate).astype(np.float32)
-        idx = (idx / idx[-1]) * (len(yp)-1)
-        yj = np.interp(idx, np.arange(len(yp), dtype=np.float32), yp).astype(np.float32)
-    except Exception:
-        yj = yp
-    return yj
-
-def _stretch_pauses(y: np.ndarray, sr: int, sentence_times: Optional[List[Tuple[float, float]]], scale: float) -> np.ndarray:
+def _stretch_pauses(
+    y: np.ndarray,
+    sr: int,
+    sentence_times: Optional[List[Tuple[float, float]]],
+    scale: float
+) -> np.ndarray:
+    """
+    Stretch the *pauses* between the provided sentence (start, end) spans.
+    Keeps sentence audio intact; applies time-stretch (librosa) only to gaps.
+    """
     y = np.asarray(y, dtype=np.float32)
-    if not sentence_times or abs(scale-1.0) < 1e-3: return y
+    if not sentence_times or abs(scale-1.0) < 1e-3:
+        return y
     n = len(y)
     sent = sorted([(max(0.0,s), max(0.0,e)) for (s,e) in sentence_times], key=lambda x:x[0])
     out: List[np.ndarray] = []
     lead_end = max(0, min(n, int(sent[0][0]*sr)))
-    if lead_end > 0: out.append(y[:lead_end])
+    if lead_end > 0:
+        out.append(y[:lead_end])
     for i,(s,e) in enumerate(sent):
         s_i = max(0, min(n, int(s*sr))); e_i = max(0, min(n, int(e*sr)))
-        if e_i > s_i: out.append(y[s_i:e_i])
+        if e_i > s_i:
+            out.append(y[s_i:e_i])
         nxt = sent[i+1][0] if i+1 < len(sent) else (n/ sr)
         p1, p2 = e_i, max(0, min(n, int(nxt*sr)))
         if p2 > p1:
@@ -201,14 +147,87 @@ def _stretch_pauses(y: np.ndarray, sr: int, sentence_times: Optional[List[Tuple[
     except Exception:
         return y
 
+# zero-phase helpers
+def _butter_sos(sr, cutoff, btype, order=4):
+    nyq = 0.5 * float(sr)
+    wc = float(cutoff) / max(1e-9, nyq)
+    wc = np.clip(wc, 1e-6, 0.999999)
+    return butter(order, wc, btype=btype, output='sos')
+
+def _lp_zp(y: np.ndarray, sr: int, cutoff: float, order: int = 4) -> np.ndarray:
+    sos = _butter_sos(sr, cutoff, 'low', order=order)
+    return sosfiltfilt(sos, y).astype(np.float32)
+
+def _hp_zp(y: np.ndarray, sr: int, cutoff: float, order: int = 2) -> np.ndarray:
+    sos = _butter_sos(sr, cutoff, 'high', order=order)
+    return sosfiltfilt(sos, y).astype(np.float32)
+
+def _high_shelf_zp(y: np.ndarray, sr: int, gain_db: float, cutoff: float) -> np.ndarray:
+    if abs(gain_db) < 1e-3: return y
+    hp = _hp_zp(y, sr, cutoff, order=2)
+    m = 1.0 + (gain_db / 18.0)
+    m = float(np.clip(m, 0.0, 2.0))
+    return np.clip((1.0 - 0.5*m)*y + (0.5*m)*hp, -1.0, 1.0).astype(np.float32)
+
+def _low_shelf_zp(y: np.ndarray, sr: int, gain_db: float, cutoff: float) -> np.ndarray:
+    if abs(gain_db) < 1e-3: return y
+    lp = _lp_zp(y, sr, cutoff, order=2)
+    m = 1.0 + (gain_db / 18.0)
+    m = float(np.clip(m, 0.0, 2.0))
+    return np.clip((1.0 - 0.5*m)*y + (0.5*m)*lp, -1.0, 1.0).astype(np.float32)
+
+def _fade_edges(y: np.ndarray, sr: int, ms: float = 6.0) -> np.ndarray:
+    if len(y) == 0: return y
+    n = int(sr * (ms/1000.0))
+    n = max(8, min(n, len(y)//4))
+    if n <= 0: return y
+    env = np.ones_like(y)
+    ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    env[:n] *= ramp
+    env[-n:] *= ramp[::-1]
+    return (y * env).astype(np.float32)
+
+def _anti_alias(y: np.ndarray, sr: int) -> np.ndarray:
+    cutoff = min(0.45*sr, 11000.0)
+    return _lp_zp(y, sr, cutoff, order=4)
+
+# --------- LUFS-like measurement & normalization ----------
+def _k_weighting_sos(sr: int):
+    # Very light approximation of ITU-R BS.1770 K-weighting
+    return _butter_sos(sr, 40.0, 'high', order=2)
+
+def _lufs_like(y: np.ndarray, sr: int) -> float:
+    y = np.asarray(y, dtype=np.float32)
+    if len(y) == 0: return -np.inf
+    sos = _k_weighting_sos(sr)
+    yk = sosfiltfilt(sos, y).astype(np.float32)
+    ms = float(np.mean(yk**2) + 1e-12)
+    # Empirical offset to roughly map RMS to LUFS after K-weighting
+    return float(-0.691 + 10.0*np.log10(ms))
+
+def _loudness_normalize(y: np.ndarray, sr: int,
+                        target_lufs: float = _TARGET_LUFS,
+                        max_gain_db: float = _MAX_MAKEUP_DB,
+                        gate_lufs: float = _GATE_LUFS) -> np.ndarray:
+    cur = _lufs_like(y, sr)
+    if not np.isfinite(cur) or cur < gate_lufs:
+        # too quiet / essentially silence → skip to avoid boosting noise floor
+        return y
+    delta = target_lufs - cur
+    delta = float(np.clip(delta, -0.1, max_gain_db))  # only upward makeup up to cap
+    gain = _db_to_lin(delta)
+    y2 = (y * gain).astype(np.float32)
+    # safety limiter
+    y2 = _limiter_soft(y2, thr_db=-1.5)
+    return y2
+
 # ---------- Parameter calibration ----------
 def _calibrate_params(preset: str, params: dict, lang: str) -> dict:
     lim = _LIMITS.get(preset, _LIMITS["neutral"])
     out = params.copy()
 
-    # Mandarin pitch safety
     if lang.lower().startswith("zh"):
-        out["pitch_st"] = float(np.clip(out["pitch_st"], -0.9, 0.9))
+        out["pitch_st"] = float(np.clip(out["pitch_st"], -1.0, 1.0))
 
     def cap(v, lo, hi): return float(np.clip(v, lo, hi))
     req = dict(**out)
@@ -219,11 +238,9 @@ def _calibrate_params(preset: str, params: dict, lang: str) -> dict:
     out["comp_ratio"] = max(1.0, min(lim["comp_ratio"], float(out["comp_ratio"])))
     out["drive"]      = max(0.0, min(lim["drive"], float(out.get("drive", 0.0))))
 
-    # global caps
     out["pitch_st"] = cap(out["pitch_st"], -_MAX_PITCH_ST_GLOBAL, _MAX_PITCH_ST_GLOBAL)
     out["rate"]     = cap(out["rate"],     -_MAX_RATE_FRAC_GLOBAL, _MAX_RATE_FRAC_GLOBAL)
 
-    # clamp logs
     def log_clamp(name):
         if abs(req[name] - out[name]) > 1e-6:
             logger.debug(f"[Emotion] clamp {name}: {req[name]:+.2f} -> {out[name]:+.2f}")
@@ -241,9 +258,6 @@ def apply_emotion(
     sentence_times: Optional[List[Tuple[float, float]]] = None,
     exaggerate: bool = True,
 ) -> np.ndarray:
-    """
-    Ultra-obvious pure-DSP shaping with SMALL rate adjustments.
-    """
     p = (preset or "neutral").lower()
     if p not in _BASE_PRESETS:
         logger.warning(f"[Emotion] Unknown preset '{preset}', defaulting to neutral.")
@@ -253,7 +267,7 @@ def apply_emotion(
 
     ex = 1.0
     if exaggerate:
-        ex = 1.45 if p == "angry" else 1.25 if p == "happy" else 1.25 if p == "sad" else 1.05
+        ex = 1.55 if p == "angry" else 1.35 if p == "happy" else 1.35 if p == "sad" else 1.05
     base = {k: (v * strength * ex if isinstance(v,(int,float)) else v) for k,v in _BASE_PRESETS[p].items()}
     params = _calibrate_params(p, base, lang)
 
@@ -266,56 +280,67 @@ def apply_emotion(
 
     y = np.asarray(wav, dtype=np.float32)
 
-    # Prosody (keep rate subtle)
+    # Prosody (small)
     if abs(params["pitch_st"]) > 1e-3:
-        try: y = librosa.effects.pitch_shift(y, sr=sr, n_steps=float(params["pitch_st"])).astype(np.float32)
-        except Exception as e: logger.warning(f"[Emotion] pitch_shift failed: {e}")
+        try:
+            y = librosa.effects.pitch_shift(y, sr=sr, n_steps=float(params["pitch_st"])).astype(np.float32)
+        except Exception as e:
+            logger.warning(f"[Emotion] pitch_shift failed: {e}")
 
     if abs(params["rate"]) > 1e-3:
-        try: y = librosa.effects.time_stretch(y, rate=float(1.0 + params["rate"])).astype(np.float32)
-        except Exception as e: logger.warning(f"[Emotion] time_stretch failed: {e}")
+        try:
+            y = librosa.effects.time_stretch(y, rate=float(1.0 + params["rate"])).astype(np.float32)
+        except Exception as e:
+            logger.warning(f"[Emotion] time_stretch failed: {e}")
 
     if sentence_times:
         y = _stretch_pauses(y, sr, sentence_times, float(params["pause_scale"]))
 
-    # Timbre/dynamics chains
+    # Anti-alias after time/pitch
+    y = _anti_alias(y, sr)
+
+    # Timbre/dynamics
     if p == "angry":
-        # Thin warmth, add dual bite + bright tilt, control hiss, crush, grit, snap, tension
-        y = _hp(y, sr, cutoff=200.0, order=2)
-        y = _low_shelf(y, sr, gain_db=-3.0, cutoff=360.0)
+        y = _hp_zp(y, sr, cutoff=240.0, order=2)
+        y = _low_shelf_zp(y, sr, gain_db=-3.0, cutoff=380.0)
         y = _peaking_eq(y, sr, gain_db=float(params["mid_db"]),      f0=2850.0, Q=0.9)
         y = _peaking_eq(y, sr, gain_db=float(params["mid_db"]*0.65), f0=4300.0, Q=1.0)
-        y = _high_shelf(y, sr, gain_db=float(params["shelf_db"]),    cutoff=3800.0)
-        y = _de_ess(y, sr, center=7200.0, Q=3.0, depth_db=-6.5)
-        # compression → saturation → transient snap → micro-jitter
-        y = _soft_compress(y, ratio=float(max(params["comp_ratio"], 7.0)))
-        y = _saturate(y, drive=float(max(params["drive"], 0.55)))
-        y = _transient_snap(y, amount=0.34)
-        y = _micro_jitter(y, sr, pitch_cents=12.0, rate_ppm=800.0)
-
+        y = _high_shelf_zp(y, sr, gain_db=float(params["shelf_db"]), cutoff=3800.0)
+        y = _de_ess(y, sr, center=7300.0, Q=3.0, depth_db=-6.5)
+        y = _soft_compress(y, ratio=float(max(params["comp_ratio"], 9.0)))
+        y = _saturate(y, drive=float(min(max(params["drive"], 0.58), 0.70)))
+        y = _parallel_compress(y, ratio=1.6, mix=0.18)
     elif p == "happy":
-        # Buoyant brightness + presence + upward compression + mild grit
-        y = _low_shelf(y, sr, gain_db=+2.0, cutoff=180.0)
-        y = _peaking_eq(y, sr, gain_db=float(max(params["mid_db"], 2.5)), f0=2400.0, Q=1.1)
-        y = _high_shelf(y, sr, gain_db=float(max(params["shelf_db"], 7.0)), cutoff=4200.0)
-        y = _parallel_compress(y, ratio=float(max(params["comp_ratio"], 2.2)), mix=0.38)
-        y = _saturate(y, drive=float(max(params["drive"], 0.16)))
-
+        y = _low_shelf_zp(y, sr, gain_db=+2.0, cutoff=170.0)
+        y = _peaking_eq(y, sr, gain_db=float(max(params["mid_db"], 3.2)), f0=2400.0, Q=1.05)
+        y = _high_shelf_zp(y, sr, gain_db=float(max(params["shelf_db"], 9.0)), cutoff=4200.0)
+        y = _parallel_compress(y, ratio=float(max(params["comp_ratio"], 2.6)), mix=0.40)
+        y = _saturate(y, drive=float(min(max(params["drive"], 0.20), 0.26)))
     elif p == "sad":
-        # Warmth + HF roll-off + relaxed dynamics (longer pauses already applied)
-        y = _lp(y, sr, cutoff=7000.0, order=2)
-        y = _high_shelf(y, sr, gain_db=float(min(params["shelf_db"], -6.0)), cutoff=3600.0)
-        y = _peaking_eq(y, sr, gain_db=float(min(params["mid_db"], -1.5)), f0=1800.0, Q=1.1)
-        y = _soft_compress(y, ratio=float(min(params["comp_ratio"], 1.6)))
+        y = _lp_zp(y, sr, cutoff=6000.0, order=4)
+        y = _high_shelf_zp(y, sr, gain_db=float(min(params["shelf_db"], -9.0)), cutoff=3600.0)
+        y = _peaking_eq(y, sr, gain_db=float(min(params["mid_db"], -2.2)), f0=1700.0, Q=1.15)
+        y = _soft_compress(y, ratio=float(min(params["comp_ratio"], 1.45)))
+
+    # Edge de-click + AA
+    y = _fade_edges(y, sr, ms=6.0)
+    y = _anti_alias(y, sr)
+
+    # Loudness makeup (pre-limiter)
+    pre_lufs = _lufs_like(y, sr)
+    y = _loudness_normalize(y, sr, target_lufs=_TARGET_LUFS,
+                            max_gain_db=_MAX_MAKEUP_DB, gate_lufs=_GATE_LUFS)
+    post_lufs = _lufs_like(y, sr)
+    logger.debug(f"[Emotion] Loudness {pre_lufs:.1f} LUFS → {post_lufs:.1f} LUFS (target {_TARGET_LUFS:.1f})")
 
     # Final safety
-    y = _limiter(y, thr_db=-1.0)
+    y = _limiter_soft(y, thr_db=-1.5)
     return np.clip(y, -1.0, 1.0).astype(np.float32)
 
-# ---------- Auto-tune with VA feedback (no rate escalation) ----------
-def _angry_ok(v: float, a: float) -> bool: return (a >= 0.88) and (v <= -0.35)
-def _happy_ok(v: float, a: float) -> bool: return (a >= 0.62) and (v >= +0.35)
-def _sad_ok(v: float, a: float) -> bool:   return (v <= -0.50) and (a <= 0.25)
+# ---------- Auto-tune w/ VA feedback ----------
+def _angry_ok(v: float, a: float) -> bool: return (a >= 0.92) and (v <= -0.40)
+def _happy_ok(v: float, a: float) -> bool: return (a >= 0.65) and (v >= +0.40)
+def _sad_ok(v: float, a: float) -> bool:   return (v <= -0.60) and (a <= 0.25)
 
 def auto_tune_emotion(
     wav: np.ndarray, sr: int, target_preset: str = "happy", strength: float = 0.85,
@@ -323,9 +348,6 @@ def auto_tune_emotion(
     latency_budget_s: float = 1.0, min_confidence: float = 0.35, max_iters: int = 6,
     exaggerate: bool = True
 ):
-    """
-    Escalates *non-rate* parameters until VA thresholds are met (rate stays clamped).
-    """
     t0 = time.time()
     p = (target_preset or "neutral").lower()
     if p not in _BASE_PRESETS:
@@ -338,7 +360,6 @@ def auto_tune_emotion(
     best_y = wav
     best_sc = score_emotion(best_y, sr)
 
-    # strong first pass
     cur_y = apply_emotion(best_y, sr, preset=p, strength=strength, lang=lang,
                           sentence_times=sentence_times, exaggerate=exaggerate)
     cur_sc = score_emotion(cur_y, sr)
@@ -350,7 +371,7 @@ def auto_tune_emotion(
     shelf_boost = 0.0
     drive_boost = 0.0
     comp_boost  = 0.0
-    shelf_cut_boost = 0.0  # for sad high cut
+    shelf_cut_boost = 0.0
 
     while it < max_iters and (time.time() - t0) < latency_budget_s:
         it += 1
@@ -358,53 +379,50 @@ def auto_tune_emotion(
         if _ok(v,a) and best_sc.confidence >= min_confidence:
             break
 
-        # Escalate WITHOUT touching rate
         if p == "angry":
-            if a < 0.88:   # more arousal → brighter + tighter
-                shelf_boost += 1.5; comp_boost += 0.8
-            if v > -0.35:  # more negative valence → harsher bite + drive + low warmth cut
-                bite_boost  += 1.8; drive_boost += 0.10
+            if a < 0.92:
+                shelf_boost += 1.6; comp_boost += 0.9
+            if v > -0.40:
+                bite_boost  += 2.0; drive_boost += 0.10
         elif p == "happy":
-            if a < 0.62: shelf_boost += 1.2
-            if v < 0.35: bite_boost  += 1.0; drive_boost += 0.05
+            if a < 0.65: shelf_boost += 1.3
+            if v < 0.40: bite_boost  += 1.1; drive_boost += 0.05
         elif p == "sad":
-            if a > 0.25: shelf_cut_boost += 1.5  # darker feel
-            if v > -0.50: bite_boost -= 0.6      # soften presence
+            if a > 0.25: shelf_cut_boost += 1.6
+            if v > -0.60: bite_boost -= 0.7
 
-        # Re-run apply_emotion with slightly higher strength (still rate-clamped)
-        local_strength = min(1.0, strength * (1.03 ** it))
+        local_strength = min(1.0, strength * (1.035 ** it))
         y_try = apply_emotion(best_y, sr, preset=p, strength=local_strength, lang=lang,
                               sentence_times=sentence_times, exaggerate=True)
 
-        # Macro post-tweaks (no rate)
         if p == "angry":
             if bite_boost > 0:
-                y_try = _peaking_eq(y_try, sr, gain_db=+min(4.0, bite_boost), f0=2950.0, Q=0.95)
-                y_try = _peaking_eq(y_try, sr, gain_db=+min(3.0, bite_boost*0.7), f0=4300.0, Q=1.0)
+                y_try = _peaking_eq(y_try, sr, gain_db=+min(4.5, bite_boost), f0=2950.0, Q=0.95)
+                y_try = _peaking_eq(y_try, sr, gain_db=+min(3.2, bite_boost*0.7), f0=4300.0, Q=1.0)
             if shelf_boost > 0:
-                y_try = _high_shelf(y_try, sr, gain_db=+min(4.0, shelf_boost), cutoff=4000.0)
+                y_try = _high_shelf_zp(y_try, sr, gain_db=+min(4.0, shelf_boost), cutoff=4000.0)
             if drive_boost > 0:
                 y_try = _saturate(y_try, drive=min(0.25, drive_boost))
             if comp_boost > 0:
-                y_try = _soft_compress(y_try, ratio=1.0 + min(3.0, comp_boost))
-            y_try = _limiter(y_try, thr_db=-1.0)
+                y_try = _soft_compress(y_try, ratio=1.0 + min(3.2, comp_boost))
+            y_try = _limiter_soft(y_try, thr_db=-1.5)
 
         elif p == "happy":
             if bite_boost > 0:
-                y_try = _peaking_eq(y_try, sr, gain_db=+min(3.0, bite_boost), f0=2400.0, Q=1.0)
+                y_try = _peaking_eq(y_try, sr, gain_db=+min(3.2, bite_boost), f0=2400.0, Q=1.0)
             if shelf_boost > 0:
-                y_try = _high_shelf(y_try, sr, gain_db=+min(3.0, shelf_boost), cutoff=4200.0)
+                y_try = _high_shelf_zp(y_try, sr, gain_db=+min(3.2, shelf_boost), cutoff=4200.0)
             if drive_boost > 0:
-                y_try = _saturate(y_try, drive=min(0.12, drive_boost))
-            y_try = _limiter(y_try, thr_db=-1.0)
+                y_try = _saturate(y_try, drive=min(0.14, drive_boost))
+            y_try = _limiter_soft(y_try, thr_db=-1.5)
 
         elif p == "sad":
             if shelf_cut_boost > 0:
-                y_try = _high_shelf(y_try, sr, gain_db=-min(4.0, shelf_cut_boost), cutoff=3600.0)
-                y_try = _lp(y_try, sr, cutoff=6800.0, order=2)
+                y_try = _high_shelf_zp(y_try, sr, gain_db=-min(4.5, shelf_cut_boost), cutoff=3600.0)
+                y_try = _lp_zp(y_try, sr, cutoff=6800.0, order=4)
             if bite_boost < 0:
-                y_try = _peaking_eq(y_try, sr, gain_db=max(-2.0, bite_boost), f0=2000.0, Q=1.1)
-            y_try = _limiter(y_try, thr_db=-1.0)
+                y_try = _peaking_eq(y_try, sr, gain_db=max(-2.2, bite_boost), f0=2000.0, Q=1.1)
+            y_try = _limiter_soft(y_try, thr_db=-1.5)
 
         sc_try = score_emotion(y_try, sr)
         better = (sc_try.confidence > best_sc.confidence) or (_ok(sc_try.valence, sc_try.arousal) and not _ok(best_sc.valence, best_sc.arousal))

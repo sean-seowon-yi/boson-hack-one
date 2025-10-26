@@ -165,7 +165,12 @@ def synthesize_video(
     video_volume=1.0
 ):
     translation_path = os.path.join(folder, 'translation.json')
-    input_audio = os.path.join(folder, 'audio_combined.wav')
+
+    # Prefer emotion-combined if present (harmless safety net)
+    emotion_audio = os.path.join(folder, 'audio_combined_emotion.wav')
+    default_audio = os.path.join(folder, 'audio_combined.wav')
+    input_audio = emotion_audio if os.path.exists(emotion_audio) else default_audio
+
     input_video = os.path.join(folder, 'download.mp4')
 
     if not os.path.exists(translation_path) or not os.path.exists(input_audio) or not os.path.exists(input_video):
@@ -204,9 +209,10 @@ def synthesize_video(
 
     if watermark_path:
         watermark_path = os.path.abspath(watermark_path)
-        input_list += ['-i', watermark_path]
-        fc_parts += ["[2:v]scale=iw*0.15:ih*0.15[wm]", "[v0][wm]overlay=W-w-10:H-h-10[v1]"]
-        maps_after_overlay = "[v1]"
+        if os.path.exists(watermark_path):
+            input_list += ['-i', watermark_path]
+            fc_parts += ["[2:v]scale=iw*0.15:ih*0.15[wm]", "[v0][wm]overlay=W-w-10:H-h-10[v1]"]
+            maps_after_overlay = "[v1]"
 
     filter_complex = ";".join(fc_parts)
 
@@ -275,9 +281,6 @@ def synthesize_video(
 
 
 def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, method='ffmpeg'):
-    """
-    Add subtitles to a video file.
-    """
     try:
         temp_dir = "temp"
         os.makedirs(temp_dir, exist_ok=True)
@@ -307,26 +310,7 @@ def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, metho
             logger.error(f"Input video file does not exist: {temp_video_path}")
             return False
 
-        if method == 'moviepy':
-            from moviepy import VideoFileClip, TextClip
-            from moviepy.video.tools.subtitles import SubtitlesClip
-
-            video = VideoFileClip(temp_video_path)
-            generator = lambda txt: TextClip(txt, font='font/SimHei.ttf', fontsize=24, color='white')
-            subtitles = SubtitlesClip(temp_srt_path, generator)
-            final_video = video.set_subtitles(subtitles)
-            final_video.write_videofile(temp_output_path, fps=video.fps)
-
-            if os.path.exists(temp_output_path):
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                shutil.copyfile(temp_output_path, output_path)
-                logger.info(f"Subtitle added successfully, output to: {output_path}")
-                return True
-            else:
-                logger.error(f"Output file was not generated: {temp_output_path}")
-                return False
-
-        elif method == 'ffmpeg':
+        if method == 'ffmpeg':
             font_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../font"))
             os.makedirs(font_dir, exist_ok=True)
 
@@ -364,7 +348,7 @@ def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, metho
                 return False
 
         else:
-            logger.error(f"Unsupported method: {method}. Please use 'moviepy' or 'ffmpeg'")
+            logger.error(f"Unsupported method: {method}. Please use 'ffmpeg'")
             return False
 
     except Exception as e:

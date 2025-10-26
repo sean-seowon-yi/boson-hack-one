@@ -1,8 +1,31 @@
+# -*- coding: utf-8 -*-
 import os
 import gradio as gr
 
 from tools.do_everything import do_everything
 from tools.utils import SUPPORT_VOICE
+
+# ---- Unified language maps (UI label -> code) ----
+SUBTITLE_UI_TO_CODE = {
+    "Simplified Chinese (简体中文)": "zh-cn",
+    "English": "en",
+    "Korean": "ko",
+    "Spanish": "es",
+}
+
+TTS_UI_TO_CODE = {
+    "Chinese (中文)": "zh-cn",
+    "English": "en",
+    "Korean": "ko",
+    "Spanish": "es",
+    "French": "fr",
+}
+
+def _norm_subtitle_lang(ui_label: str) -> str:
+    return SUBTITLE_UI_TO_CODE.get(ui_label, ui_label)
+
+def _norm_tts_lang(ui_label: str) -> str:
+    return TTS_UI_TO_CODE.get(ui_label, ui_label)
 
 # --- Wrapper: forwards new emotion controls to your pipeline safely ---
 def run_with_emotion(
@@ -20,9 +43,9 @@ def run_with_emotion(
     min_speakers,
     max_speakers,
     translation_method,
-    subtitle_language,
+    subtitle_language,     # UI label -> map to code
     tts_method,
-    tts_target_language,
+    tts_target_language,   # UI label -> map to code
     edgetts_voice,
     subtitles,
     playback_speed,
@@ -33,9 +56,13 @@ def run_with_emotion(
     output_resolution,
     max_workers,
     max_retries,
-    emotion,              # <--- NEW (UI dropdown)
-    emotion_strength,     # <--- NEW (UI slider)
+    emotion,               # NEW (UI dropdown)
+    emotion_strength,      # NEW (UI slider)
 ):
+    # Normalize UI labels to language codes once, pass codes downstream
+    subtitle_lang_code = _norm_subtitle_lang(subtitle_language)
+    tts_lang_code = _norm_tts_lang(tts_target_language)
+
     try:
         return do_everything(
             output_folder,
@@ -52,9 +79,9 @@ def run_with_emotion(
             min_speakers,
             max_speakers,
             translation_method,
-            subtitle_language,
+            subtitle_lang_code,     # <-- pass code (e.g., 'ko')
             tts_method,
-            tts_target_language,
+            tts_lang_code,          # <-- pass code (e.g., 'ko')
             edgetts_voice,
             subtitles,
             playback_speed,
@@ -87,9 +114,9 @@ def run_with_emotion(
             min_speakers,
             max_speakers,
             translation_method,
-            subtitle_language,
+            subtitle_lang_code,   # keep passing codes even in fallback
             tts_method,
-            tts_target_language,
+            tts_lang_code,        # keep passing codes even in fallback
             edgetts_voice,
             subtitles,
             playback_speed,
@@ -108,7 +135,7 @@ my_theme = gr.themes.Soft(primary_hue="blue", secondary_hue="green")
 full_auto_interface = gr.Interface(
     theme=my_theme,
     title="Smart Multilingual Video Dubbing/Translation",
-    fn=run_with_emotion,                         # <--- use wrapper
+    fn=run_with_emotion,  # use wrapper
     inputs=[
         gr.Textbox(label="Output folder", value="videos"),
         gr.Textbox(
@@ -142,14 +169,17 @@ full_auto_interface = gr.Interface(
 
         # Translation
         gr.Dropdown(["LLM"], label="Translation method (LLM uses Boson/Qwen)", value="LLM"),
+
+        # --- WARNING above Subtitle language ---
+        gr.Markdown("⚠️ **Note:** For now, please keep the *Subtitle language* and the *TTS target language* the same to ensure proper alignment."),
         gr.Dropdown(
-            ["Simplified Chinese (简体中文)", "Traditional Chinese (繁体中文)", "English", "Korean", "Spanish"],
+            ["Simplified Chinese (简体中文)", "English", "Korean", "Spanish"],
             label="Subtitle language",
             value="Simplified Chinese (简体中文)",
         ),
 
         # TTS
-        gr.Dropdown(["Higgs", "xtts", "cosyvoice"], label="TTS method", value="Higgs"),
+        gr.Dropdown(["Higgs", "xtts"], label="TTS method", value="xtts"),
         gr.Dropdown(
             ["Chinese (中文)", "English", "Korean", "Spanish", "French"],
             label="TTS target language",
@@ -172,6 +202,8 @@ full_auto_interface = gr.Interface(
         gr.Slider(minimum=1, maximum=100, step=1, label="Max workers", value=1, visible=False),
         gr.Slider(minimum=1, maximum=10, step=1, label="Max retries", value=3, visible=False),
 
+        # --- WARNING above Emotion controls ---
+        gr.Markdown("⚠️ **Experimental:** Emotion shaping is under active development. It works, but audio can be choppy."),
         # --- NEW: Emotion controls (auto-tuned via Higgs-understanding in pipeline) ---
         gr.Dropdown(
             ["natural", "happy", "sad", "angry"],
@@ -192,9 +224,12 @@ full_auto_interface = gr.Interface(
     allow_flagging="never",
 )
 
-demo = full_auto_interface
-
-demo = demo.queue(concurrency_count=1, max_size=8)
+app = full_auto_interface
 
 if __name__ == "__main__":
-    demo.launch()  # no host/port/share/inbrowser args
+    app.launch(
+        server_name="127.0.0.1",
+        server_port=6006,
+        share=True,
+        inbrowser=True,
+    )
