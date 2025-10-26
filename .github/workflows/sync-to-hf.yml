@@ -2,7 +2,7 @@ name: Sync to Hugging Face hub
 
 on:
   push:
-    branches: [ hf-deploy ]
+    branches: [ hf-deploy ]   # Push to this branch to deploy
   workflow_dispatch:
 
 jobs:
@@ -51,16 +51,25 @@ jobs:
             "*.pth filter=lfs diff=lfs merge=lfs -text" \
             "*.ttf filter=lfs diff=lfs merge=lfs -text" \
             > .gitattributes
+
+          # Sanity checks for runtime files
           test -f README.md || (echo "ERROR: README.md missing" && exit 1)
           test -f requirements.txt || (echo "ERROR: requirements.txt missing" && exit 1)
+
           git add -A
           git commit -m "Deploy snapshot for HF Space (LFS pointers, heavy tests removed)"
+          git branch -M main  # ensure local branch name is 'main' for later steps
 
       - name: Push snapshot to Hugging Face Space
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}   # Add this secret in GitHub repo settings
         working-directory: deploy
         run: |
+          # Add Space remote with token (not stored in repo)
           git remote add space "https://JackyyyWang:${HF_TOKEN}@huggingface.co/spaces/JackyyyWang/BosonAI_Hackathon.git"
-          git push --force space HEAD:main
+
+          # Push this single-commit snapshot as Space main
+          git push --force space main:main
+
+          # Upload all LFS objects referenced by this snapshot
           git lfs push --all space main
