@@ -1,16 +1,3 @@
----
-title: BosonAI Hackathon
-emoji: 🏃
-colorFrom: pink
-colorTo: indigo
-sdk: gradio
-sdk_version: 5.49.1
-app_file: webui.py
-pinned: false
-license: apache-2.0
-short_description: BosonAI_Hackathon
----
-
 # Intelligent Multi-language AI Dubbing/Translation Tool
 
 
