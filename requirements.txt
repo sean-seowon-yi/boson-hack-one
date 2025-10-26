@@ -1,16 +1,16 @@
 # -------------------------------
-# PyTorch CPU wheels (MUST be first)
+# PyTorch CPU wheels (must be first)
 # -------------------------------
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.3.1
 torchaudio==2.3.1
-# torchvision==0.18.1   # uncomment only if truly needed
+# If you really need torchvision, uncomment and keep versions aligned:
+# torchvision==0.18.1
 
 # -------------------------------
-# Source separation / ASR
+# Demucs (source separation)
 # -------------------------------
 demucs>=4.0.0
-git+https://github.com/m-bain/whisperx.git   # WhisperX (needs numpy >=2.0.2,<2.1)
 
 # -------------------------------
 # Web UI / plumbing
@@ -24,11 +24,7 @@ requests
 # -------------------------------
 # Media / audio stack
 # -------------------------------
-# NumPy 2.x to satisfy WhisperX
-numpy==2.0.2
-# librosa with NumPy 2 compatibility
-librosa==0.10.2.post1
-scipy>=1.11
+librosa==0.10.2
 soundfile
 audioread
 ffmpeg-python
@@ -38,7 +34,8 @@ imageio
 imageio-ffmpeg
 audiostretchy
 wget==3.2
-pyarrow
+numpy==1.26.3
+scipy
 
 # -------------------------------
 # NLP / models
@@ -46,14 +43,20 @@ pyarrow
 transformers==4.39.3
 accelerate
 diffusers==0.27.2
+pyarrow
 
 # -------------------------------
 # TTS / ASR / supporting libs
 # -------------------------------
 edge-tts
-aiohttp
+aiohttp           # edge-tts needs this
 funasr
 modelscope
 conformer==0.3.2
 WeTextProcessing==1.0.3
 HyperPyYAML==1.2.2
+
+# Optional extras you might enable later:
+# git+https://github.com/m-bain/whisperx.git
+# openai
+# translators
