@@ -440,7 +440,7 @@ demo = gr.Interface(
         ),
         gr.Dropdown(["LLM"], label="Translation method", value="LLM"),
         gr.Dropdown(
-            ["Chinese (中文)", "English", "Korean", "Spanish"],
+            ["Chinese (中文)", "English", "Korean", "Spanish", "French"],
             label="Subtitle language",
             value="Chinese (中文)",
             elem_id="subtitle_lang_box",
