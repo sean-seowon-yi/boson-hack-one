@@ -1,3 +1,9 @@
+---
+title: pentalingual
+app_file: webui.py
+sdk: gradio
+sdk_version: 5.49.1
+---
 # Intelligent Multi-language AI Dubbing/Translation Tool
 
 

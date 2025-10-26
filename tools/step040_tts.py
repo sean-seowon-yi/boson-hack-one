@@ -5,7 +5,7 @@ TTS synthesis pipeline (per-line => stitched track)
 - Backend dispatch to XTTS / CosyVoice / EdgeTTS / Higgs
 - Precise timing via time-stretch with bounds
 - Deterministic language support checks with unified language codes
-- NEW: Optional per-line emotion injection (post-stretch, pre-concatenate)
+- Optional per-line emotion injection (post-stretch, pre-concatenate)
 """
 
 import os
@@ -44,7 +44,7 @@ _RE_ALNUM_GAP = re.compile(r'(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])')
 # -----------------------
 # Unified language normalization
 #   Accepts labels or codes; returns canonical codes:
-#   'zh-cn','zh-tw','en','ko','ja','es','fr','pl'
+#   'zh-cn','en','ko','es','fr'
 # -----------------------
 _LANG_ALIASES = {
     # Simplified Chinese
@@ -52,30 +52,20 @@ _LANG_ALIASES = {
     "chinese (中文)": "zh-cn", "chinese": "zh-cn", "中文": "zh-cn",
     "simplified chinese (简体中文)": "zh-cn", "simplified chinese": "zh-cn", "简体中文": "zh-cn",
 
-    # Traditional Chinese
-    "zh-tw": "zh-tw", "zh_tw": "zh-tw", "tw": "zh-tw",
-    "traditional chinese (繁体中文)": "zh-tw", "traditional chinese": "zh-tw", "繁体中文": "zh-tw",
-
     # English
     "en": "en", "english": "en",
 
     # Korean
     "ko": "ko", "korean": "ko", "한국어": "ko",
 
-    # Japanese
-    "ja": "ja", "japanese": "ja", "日本語": "ja",
-
     # Spanish
     "es": "es", "spanish": "es", "español": "es",
 
     # French
     "fr": "fr", "french": "fr", "français": "fr",
-
-    # Polish
-    "pl": "pl", "polish": "pl",
 }
 
-_ALLOWED_CODES = {"zh-cn", "zh-tw", "en", "ko", "ja", "es", "fr", "pl"}
+_ALLOWED_CODES = {"zh-cn", "en", "ko", "es", "fr"}
 
 @lru_cache(maxsize=128)
 def normalize_lang_to_code(lang: str) -> str:
@@ -88,7 +78,7 @@ def normalize_lang_to_code(lang: str) -> str:
     return code
 
 def is_chinese_code(code: str) -> bool:
-    return code in ("zh-cn", "zh-tw")
+    return code in ("zh-cn",)
 
 
 # -----------------------
@@ -98,7 +88,7 @@ def is_chinese_code(code: str) -> bool:
 def preprocess_text(text: str, target_lang_code: str) -> str:
     """
     Minimal, language-aware text normalization.
-    Only apply Chinese-specific rules when target is Chinese (zh-cn/zh-tw).
+    Only apply Chinese-specific rules when target is Chinese (zh-cn).
     """
     t = text or ""
 
@@ -157,13 +147,13 @@ def adjust_audio_length(
 
 
 # -----------------------
-# Backend support map (codes)
+# Backend support map (codes) — restricted to 5 langs
 # -----------------------
 tts_support_languages = {
-    'xtts':      {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'pl', 'es'},
-    'EdgeTTS':   {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'es', 'pl'},
-    'cosyvoice': {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr'},
-    'Higgs':     {'zh-cn', 'zh-tw', 'en', 'ja', 'ko', 'fr', 'es'},
+    'xtts':      {'zh-cn', 'en', 'ko', 'es', 'fr'},
+    'EdgeTTS':   {'zh-cn', 'en', 'ko', 'es', 'fr'},
+    'cosyvoice': {'zh-cn', 'en', 'ko', 'es', 'fr'},
+    'Higgs':     {'zh-cn', 'en', 'ko', 'es', 'fr'},
 }
 
 _BACKEND_LANG_ADAPTER = {
@@ -206,7 +196,7 @@ def _synthesize_one_line(method: str, text: str, out_path: str, speaker_wav: str
                          target_lang_code: str, voice: str):
     """
     Dispatch to the selected backend. Backends write WAV to out_path.
-    target_lang_code is one of: 'zh-cn','zh-tw','en','ko','ja','es','fr','pl'
+    target_lang_code is one of: 'zh-cn','en','ko','es','fr'
     """
     lang = _adapt_lang_for_backend(method, target_lang_code)
 

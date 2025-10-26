@@ -18,14 +18,22 @@ from loguru import logger
 load_dotenv()
 
 # Normalize user-friendly labels to ISO-ish codes used by translators
+# Restricted to: zh-CN, en, ko, es, fr
 _LANG_MAP = {
-    '中文': 'zh-CN', '简体中文': 'zh-CN', '繁体中文': 'zh-TW', 'chinese': 'zh-CN', 'zh': 'zh-CN',
+    # Simplified Chinese
+    '中文': 'zh-CN', '简体中文': 'zh-CN', 'chinese': 'zh-CN', 'zh': 'zh-CN', 'zh-cn': 'zh-CN',
+
+    # English
     'English': 'en', 'english': 'en', 'en': 'en',
-    '日本語': 'ja', 'japanese': 'ja', 'ja': 'ja',
+
+    # Korean
     '한국어': 'ko', 'korean': 'ko', 'ko': 'ko',
+
+    # Spanish
     'español': 'es', 'spanish': 'es', 'es': 'es',
+
+    # French
     'français': 'fr', 'french': 'fr', 'fr': 'fr',
-    'deutsch': 'de', 'german': 'de', 'de': 'de',
 }
 
 def _norm_lang(label: str) -> str:
@@ -58,12 +66,10 @@ def translator_response(messages, to_language: str = 'zh-CN', translator_server:
             return out
         except Exception as e:
             logger.info(f'[MT] translate failed on {server} (attempt {attempt+1}): {e}')
-            # Switch server once if first server fails
             if attempt == 0:
                 server = 'google' if server != 'google' else 'bing'
             continue
 
-    # If all attempts failed
     logger.warning("[MT] translation fell back to input text due to repeated failures.")
     return str(messages)
 

@@ -19,7 +19,7 @@ Public API (dispatcher-compatible):
 
 Notes:
   - Speak EXACTLY the provided `text` (pipeline passes line['translation']).
-  - Unified language codes expected: zh-cn, zh-tw, en, ko, ja, es, fr.
+  - Unified language codes expected: zh-cn, en, ko, es, fr.
 """
 
 from __future__ import annotations
@@ -54,18 +54,11 @@ _LANG_ALIASES: Dict[str, str] = {
     "chinese (中文)": "zh-cn", "chinese": "zh-cn", "中文": "zh-cn",
     "simplified chinese (简体中文)": "zh-cn", "simplified chinese": "zh-cn", "简体中文": "zh-cn",
 
-    # Traditional Chinese
-    "zh-tw": "zh-tw", "zh_tw": "zh-tw", "tw": "zh-tw",
-    "traditional chinese (繁体中文)": "zh-tw", "traditional chinese": "zh-tw", "繁体中文": "zh-tw",
-
     # English
     "en": "en", "english": "en",
 
     # Korean
     "ko": "ko", "korean": "ko", "한국어": "ko",
-
-    # Japanese
-    "ja": "ja", "japanese": "ja", "日本語": "ja",
 
     # Spanish
     "es": "es", "spanish": "es", "español": "es",
@@ -74,14 +67,12 @@ _LANG_ALIASES: Dict[str, str] = {
     "fr": "fr", "french": "fr", "français": "fr",
 }
 
-_ALLOWED_LANGS = {"zh-cn", "zh-tw", "en", "ko", "ja", "es", "fr"}
+_ALLOWED_LANGS = {"zh-cn", "en", "ko", "es", "fr"}
 
 # Accent defaults by language code
 DEFAULT_REGION: Dict[str, str] = {
     "en": "US",
     "zh-cn": "China",
-    "zh-tw": "Taiwan",
-    "ja": "Japan",
     "ko": "Korea",
     "fr": "France",
     "es": "Spain",
@@ -114,7 +105,6 @@ def _norm_lang(s: Optional[str]) -> str:
     key = _canon(s)
     code = _LANG_ALIASES.get(key, key)
     if code not in _ALLOWED_LANGS:
-        # If empty, fallback to en; otherwise raise loudly to catch misconfig upstream
         if code == "":
             return "en"
         raise ValueError(f"[HIGGS TTS] Unsupported language: {s} -> {code}")
@@ -127,16 +117,12 @@ def _looks_ascii_english(text: str) -> bool:
         text.encode("ascii")
     except UnicodeEncodeError:
         return False
-    # ASCII but not just punctuation/whitespace
     return any(c.isalpha() for c in text)
 
 def _accent_from_voice_or_default(voice_type: Optional[str], lang_code: str) -> str:
-    # Keep simple + deterministic; if you later encode region into voice_type, adapt here.
     return DEFAULT_REGION.get(lang_code, "US")
 
 def _system_prompt(lang_code: str, region: str) -> str:
-    # Keep the model on-task: speak-only, no paraphrase/translation/additions.
-    # Use language code in prompt (server interprets code).
     return (
         f"Speak ONLY in {lang_code} with a native accent from {region}. "
         "Read the user's text verbatim; do NOT translate, paraphrase, or add words. "

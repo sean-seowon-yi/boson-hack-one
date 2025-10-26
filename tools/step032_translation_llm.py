@@ -25,6 +25,45 @@ from openai import APIError
 
 load_dotenv()
 
+# ------------------------------------------------------------------------------------
+# Language normalization (restricted to 5 langs; optional helpers — NOT used implicitly)
+# ------------------------------------------------------------------------------------
+# These helpers are included for consistency with other steps; they do not alter
+# existing behavior unless explicitly called by the caller constructing messages.
+_LANG_ALIASES: Dict[str, str] = {
+    # Simplified Chinese
+    "zh-cn": "zh-cn", "zh_cn": "zh-cn", "cn": "zh-cn",
+    "chinese (中文)": "zh-cn", "chinese": "zh-cn", "中文": "zh-cn",
+    "simplified chinese (简体中文)": "zh-cn", "simplified chinese": "zh-cn", "简体中文": "zh-cn",
+
+    # English
+    "en": "en", "english": "en",
+
+    # Korean
+    "ko": "ko", "korean": "ko", "한국어": "ko",
+
+    # Spanish
+    "es": "es", "spanish": "es", "español": "es",
+
+    # French
+    "fr": "fr", "french": "fr", "français": "fr",
+}
+_ALLOWED_LANGS = {"zh-cn", "en", "ko", "es", "fr"}
+
+def normalize_target_lang(lang: Optional[str]) -> str:
+    """
+    Optional utility for callers to normalize a target language into a canonical code.
+    Does NOT affect llm_response behavior unless used by the caller when crafting prompts.
+    """
+    key = (lang or "").strip().lower()
+    code = _LANG_ALIASES.get(key, key)
+    if code not in _ALLOWED_LANGS:
+        raise ValueError(f"Unsupported target language: {lang}")
+    return code
+
+# ------------------------------------------------------------------------------------
+# Model/env configuration (unchanged)
+# ------------------------------------------------------------------------------------
 MODEL_NAME: str = os.getenv("QWEN_TRANSLATION_MODEL", "Qwen3-32B-thinking-Hackathon")
 BOSON_API_KEY: str = os.getenv("BOSON_API_KEY", "")
 BOSON_BASE_URL: str = os.getenv("BOSON_BASE_URL", "https://hackathon.boson.ai/v1")
@@ -60,6 +99,9 @@ def _sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         role = m.get("role")
         content = m.get("content")
         if role and isinstance(content, str) and content.strip():
+            cleaned.append({"role": role, "content": content})
+        elif role and isinstance(content, list) and content:
+            # Allow for multimodal segments (e.g., input_audio) if caller passes them
             cleaned.append({"role": role, "content": content})
     return cleaned or messages
 
@@ -115,7 +157,9 @@ def _chat_completion(
         try:
             resp = client.chat.completions.create(**kwargs)
             content = getattr(resp.choices[0].message, "content", "") or ""
+            # Qwen responses may be either string or list segments
             if isinstance(content, list):
+                # Concatenate text parts; ignore non-text here since callers expect text
                 content = " ".join(
                     seg.get("text", "") if isinstance(seg, dict) else str(seg)
                     for seg in content
@@ -134,9 +178,16 @@ def _chat_completion(
     return ""
 
 def llm_response(messages: List[Dict[str, Any]], device: str = "auto") -> str:
+    """
+    Thin wrapper that returns model text content.
+    Callers are responsible for crafting prompts and enforcing schemas.
+    """
     return _chat_completion(messages)
 
 def openai_response(messages: List[Dict[str, Any]]) -> str:
+    """
+    Back-compat alias.
+    """
     return _chat_completion(messages)
 
 if __name__ == "__main__":

@@ -2,24 +2,25 @@
 """
 tools/do_everything.py
 
-End-to-end pipeline with post-TTS Emotion control automated by
-Higgs-understanding (windowed + crossfaded), using ONLY the auto batch.
+End-to-end pipeline with post-TTS Emotion control (auto-batch available).
 
-UI values supported:
-  - "natural"  -> skip emotion shaping
-  - "happy"    -> treated as "auto-happy"
-  - "sad"      -> treated as "auto-sad"
-  - "angry"    -> treated as "auto-angry"
-  - "auto-*"   -> respected as-is (e.g., "auto-happy", "auto-sad", "auto-angry")
+Folder policy (restored original style):
+  - Parent folder: <author>
+  - Child folder:  <language>_<emotion>_<short_title(no dates)>_<ttsmodel>
+  - If the child already exists, it is REMOVED and recreated (overwrite).
 
-Requires:
-  tools/step045_emotion_auto_batch.py
+Supported languages (translation + TTS):
+  - Simplified Chinese (zh-cn), English (en), Korean (ko), Spanish (es), French (fr)
 """
+
+from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import traceback
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -38,11 +39,11 @@ from .step040_tts import generate_all_wavs_under_folder
 from .step042_tts_xtts import init_TTS
 from .step043_tts_cosyvoice import init_cosyvoice
 from .step050_synthesize_video import synthesize_all_video_under_folder
-
-# Batch auto emotion remains available (but we skip it if we inject during TTS)
 from .step047_emotion_auto_batch import auto_tune_emotion_all_wavs_under_folder
 
-# Track which heavy models were initialized (process lifetime)
+# ---------------------------------------------------------------------
+# Model init flags
+# ---------------------------------------------------------------------
 models_initialized = {
     "demucs": False,
     "xtts": False,
@@ -51,48 +52,39 @@ models_initialized = {
     "funasr": False,
 }
 
-# ------------------------------------------------------------------------------------
-# Language normalization (UI labels -> codes)
-# ------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Language normalization (restricted to 5)
+# ---------------------------------------------------------------------
 _TRANSLATION_ALIASES = {
-    "simplified chinese (简体中文)": "zh-cn", "简体中文": "zh-cn", "simplified chinese": "zh-cn",
-    "chinese (simplified)": "zh-cn", "zh-cn": "zh-cn", "cn": "zh-cn",
-    "traditional chinese (繁体中文)": "zh-tw", "繁体中文": "zh-tw", "traditional chinese": "zh-tw",
-    "chinese (traditional)": "zh-tw", "zh-tw": "zh-tw", "tw": "zh-tw",
-    "english": "en", "en": "en",
-    "korean": "ko", "한국어": "ko", "ko": "ko",
-    "spanish": "es", "español": "es", "es": "es",
-}
-
-_TTS_ALIASES = {
-    "chinese (中文)": "zh-cn", "中文": "zh-cn", "chinese": "zh-cn", "zh": "zh-cn", "zh-cn": "zh-cn",
-    "traditional chinese": "zh-tw", "繁体中文": "zh-tw", "zh-tw": "zh-tw",
+    "simplified chinese (简体中文)": "zh-cn", "简体中文": "zh-cn", "chinese": "zh-cn", "zh-cn": "zh-cn", "zh": "zh-cn",
     "english": "en", "en": "en",
     "korean": "ko", "한국어": "ko", "ko": "ko",
     "spanish": "es", "español": "es", "es": "es",
     "french": "fr", "français": "fr", "fr": "fr",
 }
-
-_ALLOWED_SUB_LANGS = {"zh-cn", "zh-tw", "en", "ko", "es"}
-_ALLOWED_TTS_LANGS = {"zh-cn", "zh-tw", "en", "ko", "es", "fr"}
+_TTS_ALIASES = {
+    "chinese (中文)": "zh-cn", "中文": "zh-cn", "chinese": "zh-cn", "zh": "zh-cn", "zh-cn": "zh-cn",
+    "english": "en", "en": "en",
+    "korean": "ko", "韩国语": "ko", "한국어": "ko", "ko": "ko",
+    "spanish": "es", "español": "es", "es": "es",
+    "french": "fr", "français": "fr", "fr": "fr",
+}
+_ALLOWED_SUB_LANGS = {"zh-cn", "en", "ko", "es", "fr"}
+_ALLOWED_TTS_LANGS = {"zh-cn", "en", "ko", "es", "fr"}
 
 def _canon(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    return str(s).strip().lower()
+    return None if s is None else str(s).strip().lower()
 
-def _norm_translation_lang(ui_label_or_code: str) -> str:
-    key = _canon(ui_label_or_code)
-    code = _TRANSLATION_ALIASES.get(key, key)
+def _norm_translation_lang(v: str) -> str:
+    code = _TRANSLATION_ALIASES.get(_canon(v), _canon(v))
     if code not in _ALLOWED_SUB_LANGS:
-        raise ValueError(f"Unrecognized subtitle/translation language: {ui_label_or_code}")
+        raise ValueError(f"Unrecognized subtitle/translation language: {v}")
     return code
 
-def _norm_tts_lang(ui_label_or_code: str) -> str:
-    key = _canon(ui_label_or_code)
-    code = _TTS_ALIASES.get(key, key)
+def _norm_tts_lang(v: str) -> str:
+    code = _TTS_ALIASES.get(_canon(v), _canon(v))
     if code not in _ALLOWED_TTS_LANGS:
-        raise ValueError(f"Unrecognized TTS language: {ui_label_or_code}")
+        raise ValueError(f"Unrecognized TTS language: {v}")
     return code
 
 def _coerce_int_or_none(x):
@@ -113,14 +105,111 @@ def get_available_gpu_memory() -> float:
     except Exception:
         return 0.0
 
+# ---------------------------------------------------------------------
+# Folder helpers (author parent + language_emotion_title_ttsmodel child)
+# ---------------------------------------------------------------------
+def _slugify_component(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace("/", "-").replace("\\", "-").replace(":", "-")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_") or "unknown"
 
+def _strip_dates(title: str) -> str:
+    if not title:
+        return title
+    s = str(title)
+    s = re.sub(r"\b(?:19|20)\d{2}[-./]\d{1,2}[-./]\d{1,2}\b", "", s)  # 2018-06-11 / 2018.06.11 / 2018/06/11
+    s = re.sub(r"\b(?:19|20)\d{6}\b", "", s)                          # 20180611
+    s = re.sub(r"\s{2,}", " ", s).strip(" -_")
+    return s
+
+def _truncate_reasonably(s: str, max_len: int) -> str:
+    if not s:
+        return s
+    s = s.strip()
+    if len(s) <= max_len:
+        return s
+    cut = s[:max_len+1]
+    last_space = cut.rfind(" ")
+    if last_space >= max_len // 2:
+        return cut[:last_space].rstrip() + "…"
+    return s[:max_len].rstrip() + "…"
+
+def _shorten_title(raw_title: str) -> str:
+    tmax = int(os.getenv("TITLE_MAX_LEN", "64"))  # room for added components
+    return _truncate_reasonably(_strip_dates(raw_title or "untitled"), tmax) or "untitled"
+
+def _extract_author(info, author_override: Optional[str]) -> str:
+    if author_override:
+        return author_override
+    if isinstance(info, dict):
+        for key in ("uploader", "channel", "author", "owner", "artist"):
+            v = info.get(key)
+            if v:
+                return str(v)
+    return "local"
+
+def _compose_author_title_folder(
+    root_folder: str,
+    base_folder: str,
+    title: str,
+    author: str,
+    lang_code: str,
+    emotion: str,
+    tts_model: str,
+    overwrite: bool = True,   # always overwrite duplicates per request
+) -> str:
+    """
+    Create: <root>/<author>/<language>_<emotion>_<short_title>_<ttsmodel>
+    Move contents of base_folder into the child folder.
+    """
+    author_dir = os.path.join(root_folder, _slugify_component(author or "local"))
+    os.makedirs(author_dir, exist_ok=True)
+
+    child_name = "_".join([
+        _slugify_component(lang_code or "en"),
+        _slugify_component((emotion or "natural").lower()),
+        _slugify_component(_shorten_title(title)),
+        _slugify_component((tts_model or "tts").lower()),
+    ])
+    child_path = os.path.join(author_dir, child_name)
+
+    if os.path.exists(child_path) and overwrite:
+        logger.info(f"[Overwrite] Removing existing child folder: {child_path}")
+        shutil.rmtree(child_path, ignore_errors=True)
+    os.makedirs(child_path, exist_ok=True)
+
+    # Move/copy everything from the temporary base folder into the final child folder
+    if os.path.abspath(base_folder) != os.path.abspath(child_path) and os.path.isdir(base_folder):
+        for name in os.listdir(base_folder):
+            src = os.path.join(base_folder, name)
+            dst = os.path.join(child_path, name)
+            try:
+                shutil.move(src, dst)
+            except Exception:
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                    shutil.rmtree(src, ignore_errors=True)
+                else:
+                    shutil.copy2(src, dst)
+                    try:
+                        os.remove(src)
+                    except Exception:
+                        pass
+        try:
+            os.rmdir(base_folder)
+        except Exception:
+            pass
+
+    return child_path
+
+# ---------------------------------------------------------------------
+# Initialization
+# ---------------------------------------------------------------------
 def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> None:
     global models_initialized
     futures = []
-
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            # Demucs
             if not models_initialized["demucs"]:
                 futures.append(executor.submit(init_demucs))
                 models_initialized["demucs"] = True
@@ -128,7 +217,6 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
             else:
                 logger.info("Demucs already initialized — skipping")
 
-            # TTS
             if tts_method == "xtts":
                 if not models_initialized["xtts"]:
                     futures.append(executor.submit(init_TTS))
@@ -142,19 +230,14 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
             elif tts_method == "Higgs":
                 logger.info("TTS 'Higgs' selected — API-based")
 
-            # ASR (Higgs path is API-based)
-            if asr_method == "FunASR":
-                if not models_initialized.get("funasr", False):
-                    # Placeholder: init_funasr must exist if you enable this
-                    # futures.append(executor.submit(init_funasr))
-                    models_initialized["funasr"] = True
-                    logger.info("Initialized FunASR")
+            if asr_method == "FunASR" and not models_initialized.get("funasr", False):
+                models_initialized["funasr"] = True
+                logger.info("Initialized FunASR")
             elif asr_method == "Higgs":
                 logger.info("ASR 'Higgs' selected — API-based")
 
             for fut in futures:
                 fut.result()
-
     except Exception as e:
         stack_trace = traceback.format_exc()
         logger.error(f"Failed to initialize models: {e}\n{stack_trace}")
@@ -162,7 +245,9 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
         release_model()
         raise
 
-
+# ---------------------------------------------------------------------
+# Core processing
+# ---------------------------------------------------------------------
 def process_video(
     info,
     root_folder,
@@ -193,10 +278,9 @@ def process_video(
     *,
     emotion: str = "natural",
     emotion_strength: float = 0.6,
+    overwrite_duplicates: bool = True,       # default overwrite
+    author_override: Optional[str] = None,
 ):
-    """
-    Process a single video end-to-end with optional progress callback.
-    """
     stages = [
         ("Downloading video...", 10),
         ("Separating vocals...", 15),
@@ -205,7 +289,6 @@ def process_video(
         ("Synthesizing speech...", 20),
         ("Compositing video...", 10),
     ]
-
     current_stage = 0
     progress_base = 0
 
@@ -220,179 +303,126 @@ def process_video(
                 progress_callback(progress_base, stage_name)
 
             if isinstance(info, str) and info.endswith(".mp4"):
-                import shutil
                 original_file_name = os.path.basename(info)
-                folder_name = os.path.splitext(original_file_name)[0]
-                folder = os.path.join(root_folder, folder_name)
-                os.makedirs(folder, exist_ok=True)
-                dest_path = os.path.join(folder, "download.mp4")
-                shutil.copy(info, dest_path)
+                base_folder_name = os.path.splitext(original_file_name)[0]
+                base_folder = os.path.join(root_folder, base_folder_name)
+                os.makedirs(base_folder, exist_ok=True)
+                dest_path = os.path.join(base_folder, "download.mp4")
+                shutil.copy2(info, dest_path)
             else:
-                folder = get_target_folder(info, root_folder)
-                if folder is None:
+                base_folder = get_target_folder(info, root_folder)
+                if base_folder is None:
                     error_msg = f'Unable to derive target folder: {info.get("title") if isinstance(info, dict) else info}'
                     logger.warning(error_msg)
                     return False, None, error_msg
-
-                folder = download_single_video(info, root_folder, resolution)
-                if folder is None:
+                base_folder = download_single_video(info, root_folder, resolution)
+                if base_folder is None:
                     error_msg = f'Download failed: {info.get("title") if isinstance(info, dict) else info}'
                     logger.warning(error_msg)
                     return False, None, error_msg
 
-            logger.info(f"Processing video folder: {folder}")
+            # Compose final working folder:
+            # <root>/<author>/<language>_<emotion>_<short_title>_<ttsmodel>
+            author = _extract_author(info, author_override)
+            raw_title = info.get("title") if isinstance(info, dict) else os.path.basename(base_folder)
+            tts_lang_code = _norm_tts_lang(tts_target_language)
+
+            folder = _compose_author_title_folder(
+                root_folder=root_folder,
+                base_folder=base_folder,
+                title=raw_title,
+                author=author,
+                lang_code=tts_lang_code,
+                emotion=emotion,
+                tts_model=tts_method,
+                overwrite=True,  # enforce overwrite on duplicates
+            )
+            logger.info(
+                f"Processing folder: {folder} "
+                f"(author='{author}', lang={tts_lang_code}, emotion={emotion}, tts={tts_method})"
+            )
 
             # Stage: Vocal separation
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
-
-            try:
-                status, vocals_path, _ = separate_all_audio_under_folder(
-                    folder, model_name=demucs_model, device=device, progress=True, shifts=shifts
-                )
-                logger.info(f"Vocal separation complete: {vocals_path}")
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f"Vocal separation failed: {e}\n{stack_trace}"
-                logger.error(error_msg)
-                return False, None, error_msg
+            current_stage += 1; progress_base += stage_weight
+            if progress_callback: progress_callback(progress_base, stages[current_stage][0])
+            status, vocals_path, _ = separate_all_audio_under_folder(
+                folder, model_name=demucs_model, device=device, progress=True, shifts=shifts
+            )
+            logger.info(f"Vocal separation complete: {vocals_path}")
 
             # Stage: ASR
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
-
-            try:
-                whisper_min_speakers_c = _coerce_int_or_none(whisper_min_speakers)
-                whisper_max_speakers_c = _coerce_int_or_none(whisper_max_speakers)
-
-                status, result_json = transcribe_all_audio_under_folder(
-                    folder,
-                    asr_method=asr_method,
-                    whisper_model_name=whisper_model,
-                    device=device,
-                    batch_size=batch_size,
-                    diarization=diarization,
-                    min_speakers=whisper_min_speakers_c,
-                    max_speakers=whisper_max_speakers_c,
-                )
-                logger.info(f"ASR completed: {status}")
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f"ASR failed: {e}\n{stack_trace}"
-                logger.error(error_msg)
-                return False, None, error_msg
+            current_stage += 1; progress_base += stages[current_stage-1][1]
+            if progress_callback: progress_callback(progress_base, stages[current_stage][0])
+            status, result_json = transcribe_all_audio_under_folder(
+                folder,
+                asr_method=asr_method,
+                whisper_model_name=whisper_model,
+                device=device,
+                batch_size=batch_size,
+                diarization=diarization,
+                min_speakers=_coerce_int_or_none(whisper_min_speakers),
+                max_speakers=_coerce_int_or_none(whisper_max_speakers),
+            )
+            logger.info(f"ASR completed: {status}")
 
             # Stage: Translation
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
+            current_stage += 1; progress_base += stages[current_stage-1][1]
+            if progress_callback: progress_callback(progress_base, stages[current_stage][0])
+            translation_target_language = _norm_translation_lang(translation_target_language)
+            msg, summary, translation = translate_all_transcript_under_folder(
+                folder, method=translation_method, target_language=translation_target_language
+            )
+            logger.info(f"Translation completed: {msg}")
 
+            # Stage: TTS (with in-TTS emotion injection)
+            current_stage += 1; progress_base += stages[current_stage-1][1]
+            if progress_callback: progress_callback(progress_base, stages[current_stage][0])
+            tts_target_language = _norm_tts_lang(tts_target_language)
+            status, synth_path, _ = generate_all_wavs_under_folder(
+                folder,
+                method=tts_method,
+                target_language=tts_target_language,
+                voice=voice,
+                emotion=emotion,
+                emotion_strength=emotion_strength,
+            )
+            logger.info(f"TTS completed: {synth_path}")
+
+            # Optional emotion batch pass (only if emotion == natural)
             try:
-                translation_target_language = _norm_translation_lang(translation_target_language)
-                logger.info(f"Subtitle/Translation language (code): {translation_target_language}")
-
-                msg, summary, translation = translate_all_transcript_under_folder(
-                    folder, method=translation_method, target_language=translation_target_language
-                )
-                logger.info(f"Translation completed: {msg}")
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f"Translation failed: {e}\n{stack_trace}"
-                logger.error(error_msg)
-                return False, None, error_msg
-
-            # Stage: TTS (NOW WITH EMOTION INJECTION)
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
-
-            try:
-                tts_target_language = _norm_tts_lang(tts_target_language)
-                logger.info(f"TTS target language (code): {tts_target_language}")
-
-                status, synth_path, _ = generate_all_wavs_under_folder(
-                    folder,
-                    method=tts_method,
-                    target_language=tts_target_language,
-                    voice=voice,
-                    # NEW: inject emotion during TTS (per-line, post-stretch)
-                    emotion=emotion,
-                    emotion_strength=emotion_strength,
-                )
-                logger.info(f"TTS completed: {synth_path}")
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f"TTS failed: {e}\n{stack_trace}"
-                logger.error(error_msg)
-                return False, None, error_msg
-
-            # Emotion batch pass: SKIP if already injected at TTS
-            try:
-                _emotion = (emotion or "natural").strip().lower()
-                already_injected = _emotion != "natural"
-                if already_injected:
-                    logger.info("Emotion already injected during TTS — skipping batch emotion pass.")
-                else:
-                    # Allow auto-* modes if user selected natural/auto
-                    if _emotion in ("happy", "sad", "angry"):
-                        _emotion = f"auto-{_emotion}"
-                    if _emotion.startswith("auto"):
-                        _lang_hint = tts_target_language or "en"
-                        ok, emsg = auto_tune_emotion_all_wavs_under_folder(
-                            folder,
-                            emotion=_emotion,
-                            strength=float(emotion_strength),
-                            lang_hint=_lang_hint,
-                            win_s=10.0,
-                            hop_s=9.0,
-                            xfade_ms=int(os.getenv("HIGGS_TTS_XFADE_MS", "28")),
-                            latency_budget_s=0.5,
-                            min_confidence=0.50,
-                            max_iters=2,
-                        )
-                        logger.info(f"Emotion (AUTO) shaping: {emsg}")
-                    else:
-                        logger.info("Emotion preset is natural — skipping batch.")
+                if (emotion or "natural").strip().lower() == "natural":
+                    _lang_hint = tts_target_language or "en"
+                    ok, emsg = auto_tune_emotion_all_wavs_under_folder(
+                        folder,
+                        emotion="auto-neutral",
+                        strength=float(emotion_strength),
+                        lang_hint=_lang_hint,
+                        win_s=10.0,
+                        hop_s=9.0,
+                        xfade_ms=int(os.getenv("HIGGS_TTS_XFADE_MS", "28")),
+                        latency_budget_s=0.5,
+                        min_confidence=0.50,
+                        max_iters=2,
+                    )
+                    logger.info(f"Emotion (AUTO) shaping: {emsg}")
             except Exception as e:
                 logger.warning(f"Emotion shaping step failed but continuing: {e}")
 
-            # Stage: Synthesis (video)
-            current_stage += 1
-            progress_base += stage_weight
-            stage_name, stage_weight = stages[current_stage]
-            if progress_callback:
-                progress_callback(progress_base, stage_name)
-
-            try:
-                status, output_video = synthesize_all_video_under_folder(
-                    folder,
-                    subtitles=subtitles,
-                    speed_up=speed_up,
-                    fps=fps,
-                    resolution=target_resolution,
-                    background_music=background_music,
-                    bgm_volume=bgm_volume,
-                    video_volume=video_volume,
-                )
-                logger.info(f"Video composition completed: {output_video}")
-            except Exception as e:
-                stack_trace = traceback.format_exc()
-                error_msg = f"Video composition failed: {e}\n{stack_trace}"
-                logger.error(error_msg)
-                return False, None, error_msg
-
-            if progress_callback:
-                progress_callback(100, "Completed!")
+            # Stage: Video synthesis
+            current_stage += 1; progress_base += stages[current_stage-1][1]
+            if progress_callback: progress_callback(progress_base, stages[current_stage][0])
+            status, output_video = synthesize_all_video_under_folder(
+                folder,
+                subtitles=subtitles,
+                speed_up=speed_up,
+                fps=fps,
+                resolution=target_resolution,
+                background_music=background_music,
+                bgm_volume=bgm_volume,
+                video_volume=video_volume,
+            )
+            if progress_callback: progress_callback(100, "Completed!")
+            logger.info(f"Video composition completed: {output_video}")
             return True, output_video, "Success"
 
         except Exception as e:
@@ -407,7 +437,9 @@ def process_video(
 
     return False, None, f"Max retries reached: {max_retries}"
 
-
+# ---------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------
 def do_everything(
     root_folder,
     url,
@@ -438,15 +470,15 @@ def do_everything(
     max_retries=5,
     progress_callback=None,
     *,
-    emotion: str = "natural",          # "natural" | "happy" | "sad" | "angry" | "auto-*" | "auto"
-    emotion_strength: float = 0.6,     # 0..1
+    emotion: str = "natural",
+    emotion_strength: float = 0.6,
+    overwrite_duplicates: bool = True,     # default overwrite for this design
+    author_override: Optional[str] = None,
 ):
     try:
-        success_list = []
-        fail_list = []
-        error_details = []
+        success_list, fail_list, error_details = [], [], []
 
-        # Normalize possibly human-readable inputs
+        # Normalize input languages early (UI labels → codes)
         try:
             translation_target_language = _norm_translation_lang(translation_target_language)
             tts_target_language = _norm_tts_lang(tts_target_language)
@@ -456,36 +488,76 @@ def do_everything(
 
         logger.info("-" * 50)
         logger.info(f"Starting job: {url}")
-        logger.info(f"Output folder={root_folder}, videos={num_videos}, download_res={resolution}")
-        logger.info(f"Vocal separation: model={demucs_model}, device={device}, shifts={shifts}")
-        logger.info(f"ASR: method={asr_method}, model={whisper_model}, batch_size={batch_size}, diarization={diarization}")
-        logger.info(f"Translate: method={translation_method}, target_lang(code)={translation_target_language}")
-        logger.info(f"TTS: method={tts_method}, target_lang(code)={tts_target_language}, voice={voice}")
-        logger.info(f"Emotion(in-TTS): preset={emotion}, strength={emotion_strength:.2f}")
-        logger.info(f"Video compose: subtitles={subtitles}, speed={speed_up}, FPS={fps}, render_res={target_resolution}")
+        logger.info(f"Output root={root_folder}, videos={num_videos}, download_res={resolution}")
+        logger.info(f"ASR: {asr_method}/{whisper_model} | Demucs: {demucs_model} shifts={shifts} device={device}")
+        logger.info(f"Translate → {translation_method} ({translation_target_language}) | TTS → {tts_method} ({tts_target_language}) voice={voice}")
+        logger.info(f"Emotion preset={emotion} strength={emotion_strength:.2f} | overwrite_duplicates={overwrite_duplicates}")
+        logger.info(f"Render: subtitles={subtitles} speed={speed_up} fps={fps} target_res={target_resolution}")
         logger.info("-" * 50)
 
-        # Normalize multiline URL list
-        normalized = (url or "").replace(" ", "").replace("，", "\n").replace(",", "\n")
+        # Warm up
+        if progress_callback:
+            progress_callback(5, "Initializing models...")
+        initialize_models(tts_method, asr_method, diarization)
+
+        # URLs
+        normalized = (url or "").replace(" ", "").replace(" ", "").replace("，", "\n").replace(",", "\n")
         urls = [u for u in normalized.split("\n") if u]
-
-        # Warm up models once
-        try:
-            if progress_callback:
-                progress_callback(5, "Initializing models...")
-            initialize_models(tts_method, asr_method, diarization)
-        except Exception as e:
-            stack_trace = traceback.format_exc()
-            logger.error(f"Model initialization failed: {e}\n{stack_trace}")
-            return f"Model initialization failed: {e}", None
-
         out_video: Optional[str] = None
 
-        # Local file convenience: handle a single .mp4 path
+        # Local file path
         if url.endswith(".mp4"):
+            success, output_video, error_msg = process_video(
+                url,
+                root_folder,
+                resolution,
+                demucs_model,
+                device,
+                shifts,
+                asr_method,
+                whisper_model,
+                batch_size,
+                diarization,
+                whisper_min_speakers,
+                whisper_max_speakers,
+                translation_method,
+                translation_target_language,
+                tts_method,
+                tts_target_language,
+                voice,
+                subtitles,
+                speed_up,
+                fps,
+                background_music,
+                bgm_volume,
+                video_volume,
+                target_resolution,
+                max_retries,
+                progress_callback,
+                emotion=emotion,
+                emotion_strength=emotion_strength,
+                overwrite_duplicates=True,      # enforce overwrite
+                author_override=author_override,
+            )
+            return ("Success", output_video) if success else (f"Failed: {error_msg}", None)
+
+        # Remote URLs
+        if progress_callback:
+            progress_callback(10, "Fetching video info...")
+        try:
+            videos_info = list(get_info_list_from_url(urls, num_videos))
+        except Exception as e:
+            stack_trace = traceback.format_exc()
+            logger.error(f"Failed to get video list: {e}\n{stack_trace}")
+            return f"Failed to get video list: {e}", None
+
+        if not videos_info:
+            return "Failed to retrieve video info. Please check the URL(s).", None
+
+        for info in videos_info:
             try:
                 success, output_video, error_msg = process_video(
-                    url,  # pass the actual file path
+                    info,
                     root_folder,
                     resolution,
                     demucs_model,
@@ -513,92 +585,23 @@ def do_everything(
                     progress_callback,
                     emotion=emotion,
                     emotion_strength=emotion_strength,
+                    overwrite_duplicates=True,  # enforce overwrite
+                    author_override=author_override,
                 )
-
                 if success:
-                    logger.info(f"Local video processed successfully: {url}")
-                    return "Success", output_video
+                    success_list.append(info)
+                    out_video = output_video
+                    logger.info(f"Processed: {info['title'] if isinstance(info, dict) else info}")
                 else:
-                    logger.error(f"Local video failed: {url}, error: {error_msg}")
-                    return f"Failed: {error_msg}", None
-
+                    fail_list.append(info)
+                    error_details.append(f"{info['title'] if isinstance(info, dict) else info}: {error_msg}")
+                    logger.error(f"Failed: {error_msg}")
             except Exception as e:
                 stack_trace = traceback.format_exc()
-                logger.error(f"Failed to process local video: {e}\n{stack_trace}")
-                return f"Failed to process local video: {e}", None
+                fail_list.append(info)
+                error_details.append(f"{info['title'] if isinstance(info, dict) else info}: {e}")
+                logger.error(f"Error: {e}\n{stack_trace}")
 
-        # Remote URLs
-        try:
-            videos_info = []
-            if progress_callback:
-                progress_callback(10, "Fetching video info...")
-
-            for video_info in get_info_list_from_url(urls, num_videos):
-                videos_info.append(video_info)
-
-            if not videos_info:
-                return "Failed to retrieve video info. Please check the URL(s).", None
-
-            for info in videos_info:
-                try:
-                    success, output_video, error_msg = process_video(
-                        info,
-                        root_folder,
-                        resolution,
-                        demucs_model,
-                        device,
-                        shifts,
-                        asr_method,
-                        whisper_model,
-                        batch_size,
-                        diarization,
-                        whisper_min_speakers,
-                        whisper_max_speakers,
-                        translation_method,
-                        translation_target_language,
-                        tts_method,
-                        tts_target_language,
-                        voice,
-                        subtitles,
-                        speed_up,
-                        fps,
-                        background_music,
-                        bgm_volume,
-                        video_volume,
-                        target_resolution,
-                        max_retries,
-                        progress_callback,
-                        emotion=emotion,
-                        emotion_strength=emotion_strength,
-                    )
-
-                    if success:
-                        success_list.append(info)
-                        out_video = output_video
-                        logger.info(f"Processed: {info['title'] if isinstance(info, dict) else info}")
-                    else:
-                        fail_list.append(info)
-                        error_details.append(
-                            f"{info['title'] if isinstance(info, dict) else info}: {error_msg}"
-                        )
-                        logger.error(
-                            f"Failed: {info['title'] if isinstance(info, dict) else info}, error: {error_msg}"
-                        )
-                except Exception as e:
-                    stack_trace = traceback.format_exc()
-                    fail_list.append(info)
-                    error_details.append(
-                        f"{info['title'] if isinstance(info, dict) else info}: {e}"
-                    )
-                    logger.error(
-                        f"Error: {info['title'] if isinstance(info, dict) else info}, error: {e}\n{stack_trace}"
-                    )
-        except Exception as e:
-            stack_trace = traceback.format_exc()
-            logger.error(f"Failed to get video list: {e}\n{stack_trace}")
-            return f"Failed to get video list: {e}", None
-
-        # Summary
         logger.info("-" * 50)
         logger.info(f"Done. success={len(success_list)}, failed={len(fail_list)}")
         if error_details:

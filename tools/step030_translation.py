@@ -12,12 +12,8 @@ Key tweaks:
 - Stricter "absolute translation" enforcement (rejects same-language paraphrases) with smart relaxations.
 - Progressive validation (strict → relaxed) + faster MT fallback.
 - Atomic writes for JSON outputs.
-- NEW: Strip <t>...</t> wrappers from all final outputs (no <t> in translation.json).
-
-Public APIs preserved:
-    summarize(...)
-    translate(...)
-    translate_all_transcript_under_folder(...)
+- Strip <t>...</t> wrappers from all final outputs (no <t> in translation.json).
+- NEW (EN-only): Lightweight English coverage guard so non-English outputs can't pass when target is English.
 """
 
 from __future__ import annotations
@@ -81,9 +77,9 @@ _RE_HIRA = re.compile(r'[\u3040-\u309f]')
 _RE_KATA = re.compile(r'[\u30a0-\u30ff]')
 _RE_HANG = re.compile(r'[\uac00-\ud7af]')
 _RE_LATN = re.compile(r'[A-Za-z]')
-_PUNC_TABLE = str.maketrans('', '', string.punctuation + "，。！？；：、“”‘’—…《》·")
+_PUNC_TABLE = str.maketrans('', '', string.punctuation + " ，。！？；：、“”‘’—…《》·")
 
-# Strip <t>...</t> safely (NEW)
+# Strip <t>...</t> safely
 _RE_T_WRAPPER = re.compile(r'^\s*<t\s*>(.*?)</t\s*>\s*$', re.IGNORECASE | re.DOTALL)
 _RE_T_TAGS    = re.compile(r'</?t\s*>', re.IGNORECASE)
 
@@ -99,7 +95,7 @@ def _strip_t_tags(s: str) -> str:
 # For CN sentence splitting
 _RE_CN_SPLIT_1 = re.compile(r'([。！？\?])([^，。！？\?”’》])')
 _RE_CN_SPLIT_2 = re.compile(r'(\.{6})([^，。！？\?”’》])')  # ......
-_RE_CN_SPLIT_3 = re.compile(r'(\…{2})([^，。！？\?”’》])')   # ……
+_RE_CN_SPLIT_3 = re.compile(r'(\…{2})([^ ，。！？\?”’》])')   # ……
 _RE_CN_SPLIT_4 = re.compile(r'([。！？\?][”’])([^ ，。！？\?”’》])')
 _RE_LAT_SPLIT = re.compile(r'(?<=[.!?])\s+')
 
@@ -205,11 +201,11 @@ def _norm_lang_label(label: str) -> str:
     if not label:
         return "unknown"
     s = label.strip().lower()
+    # Restrict to 5 languages (zh/en/ko/es/fr)
     mapping = {
         "chinese": "zh", "simplified chinese": "zh", "zh": "zh", "zh-cn": "zh", "zh_cn": "zh",
         "简体中文": "zh", "中文": "zh",
         "english": "en", "en": "en", "en-us": "en", "en_gb": "en",
-        "japanese": "ja", "ja": "ja", "日本語": "ja",
         "korean": "ko", "ko": "ko", "韩国语": "ko", "한국어": "ko",
         "spanish": "es", "es": "es", "español": "es",
         "french": "fr", "fr": "fr", "français": "fr",
@@ -217,28 +213,33 @@ def _norm_lang_label(label: str) -> str:
     return mapping.get(s, "unknown")
 
 def _heuristic_lang(text: str) -> str:
+    """
+    IMPORTANT: Only fast-path for CJK/JP/KR. Never label generic Latin text as 'en'.
+    This prevents Spanish/French from being misread as English.
+    """
     t = text or ""
     cjk = len(_RE_CJK.findall(t))
     hira = len(_RE_HIRA.findall(t))
     kata = len(_RE_KATA.findall(t))
     hang = len(_RE_HANG.findall(t))
-    latin = len(_RE_LATN.findall(t))
+
     if (hira + kata) > 0:
         return "ja"
     if hang > 0:
         return "ko"
     if cjk > 0 and (hira + kata + hang) == 0:
         return "zh"
-    if latin > 0 and (cjk + hira + kata + hang) == 0:
-        return "en"
+    # For Latin-script text (es/fr/en), return unknown so CLD3 can decide.
     return "unknown"
 
 try:
     import cld3  # type: ignore
     def _detect_lang(text: str) -> str:
-        # heuristic first (cheap), CLD3 if needed
+        """
+        Use heuristic for zh/ja/ko only; defer Latin languages (en/es/fr) to CLD3.
+        """
         h = _heuristic_lang(text)
-        if h != "unknown":
+        if h in ("zh", "ja", "ko"):
             return h
         res = cld3.get_language(text or "")
         if res and res.language:
@@ -249,10 +250,11 @@ try:
             if code.startswith("ko"): return "ko"
             if code.startswith("es"): return "es"
             if code.startswith("fr"): return "fr"
-            if code.startswith("pl"): return "pl"
-        return h
+        return "unknown"
 except Exception:
     def _detect_lang(text: str) -> str:
+        # Fallback: heuristic only. Since heuristic returns 'unknown' for Latin,
+        # validator won't incorrectly reject es/fr as 'en'.
         return _heuristic_lang(text)
 
 # ============================================================
@@ -282,6 +284,57 @@ def _is_numericish(s: str) -> bool:
     return bool(_RE_NUMERICISH.fullmatch((s or "").strip()))
 
 # ============================================================
+# NEW — English-only lightweight heuristics (used ONLY when target is English)
+# ============================================================
+_EN_COMMON = {"the","and","of","to","in","is","that","it","for","on","with","as","are","this","was","by","from","be","or"}
+_ES_COMMON = {"de","la","que","el","en","y","a","los","se","del","las","por","un","para","con","no","una","su","al","lo"}
+_FR_COMMON = {"de","la","et","les","des","en","du","que","un","une","pour","est","dans","au","aux","sur","pas","par","plus"}
+
+def _basic_latin_ratio(s: str) -> float:
+    if not s: return 0.0
+    letters = [ch for ch in s if ch.isalpha()]
+    if not letters: return 0.0
+    basic = sum(1 for ch in letters if ord(ch) < 128)
+    return basic / len(letters)
+
+def _contains_diacritics(s: str) -> bool:
+    return any(ord(ch) > 127 and ch.isalpha() for ch in s or "")
+
+def _score_stopwords(tokens: list[str], vocab: set[str]) -> float:
+    if not tokens: return 0.0
+    hits = sum(1 for t in tokens if t in vocab)
+    return hits / max(1, len(tokens))
+
+def _guess_latin_lang(text: str) -> str:
+    """
+    Very small-footprint guess among en/es/fr using stopwords & diacritics.
+    NOTE: We only use this inside the English target guard; it does not change global detection.
+    """
+    t = (text or "").lower()
+    toks = re.sub(r"[^a-zàâçéèêëîïôûùüÿñæœ\s']", " ", t).split()
+    s_en = _score_stopwords(toks, _EN_COMMON)
+    s_es = _score_stopwords(toks, _ES_COMMON)
+    s_fr = _score_stopwords(toks, _FR_COMMON)
+    # Quick heuristic: if diacritics and score margin is clear, bias to fr/es
+    has_diac = _contains_diacritics(t)
+
+    # Select best if sufficiently above the rest
+    scores = {"en": s_en, "es": s_es, "fr": s_fr}
+    best_lang = max(scores, key=scores.get)
+    best = scores[best_lang]
+    second = sorted(scores.values())[-2]
+
+    # Small margins to avoid flipping good outputs
+    if has_diac:
+        margin = 0.03
+    else:
+        margin = 0.02
+
+    if best >= 0.06 and (best - second) >= margin:
+        return best_lang
+    return "unknown"
+
+# ============================================================
 # Back-translation verification (optional)
 # ============================================================
 def _verify_by_backtranslation(src_text: str, tgt_text: str, target_language: str) -> bool:
@@ -291,7 +344,7 @@ def _verify_by_backtranslation(src_text: str, tgt_text: str, target_language: st
     try:
         src_code = _detect_lang(src_text)
         src_label = {
-            "zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean",
+            "zh": "Chinese", "en": "English", "ko": "Korean",
             "es": "Spanish", "fr": "French"
         }.get(src_code, "English")
         bt = translator_response(tgt_text, to_language=src_label, translator_server='google')
@@ -339,7 +392,7 @@ def valid_translation(
             return False, f'Output must be in {target_language}. Only output the translation (no explanations).'
         return True, t
 
-    # Must be in target language
+    # Must be in target language (only if detector is confident)
     if target_code != "unknown" and trans_code != "unknown" and trans_code != target_code:
         return False, f'Output must be in {target_language}. Only output the translation (no explanations).'
 
@@ -364,6 +417,22 @@ def valid_translation(
         min_ratio = 0.25 if strict else 0.20
         if out_len > 0 and (hang / out_len) < min_ratio:
             return False, 'Output must be in Korean. Only output the translation.'
+
+    # NEW — English coverage guard (applies ONLY when target is English)
+    if target_code == "en":
+        # 1) If our detector is confident it's non-English, reject.
+        if trans_code in ("zh", "ja", "ko", "es", "fr"):
+            return False, 'Output must be in English. Only output the translation.'
+
+        # 2) If detector is unknown/uncertain:
+        #    - ensure text is mainly basic Latin (ASCII) -> avoids passing es/fr with many diacritics
+        if _basic_latin_ratio(t) < (0.80 if strict else 0.72):
+            return False, 'Output must be in English. Only output the translation.'
+
+        # 3) If still uncertain, use a tiny stopword heuristic to reject obvious ES/FR.
+        guess = _guess_latin_lang(t)  # 'en' / 'es' / 'fr' / 'unknown'
+        if guess in ("es", "fr"):
+            return False, 'Output must be in English. Only output the translation.'
 
     # Some visible text required
     if not re.search(r'\w', t, flags=re.UNICODE) and not _RE_CJK.search(t):

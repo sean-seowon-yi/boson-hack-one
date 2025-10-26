@@ -428,7 +428,7 @@ def run_with_emotion(
 # Interface
 # =========================
 demo = gr.Interface(
-    title="Smart Multilingual Video Dubbing/Translation",
+    title="Intelligent Multilingual Video Dubbing/Translation",
     fn=run_with_emotion,
     css=CUSTOM_CSS,
     inputs=[
@@ -514,7 +514,8 @@ CUSTOM_CSS = """
 }
 
 /* Inputs/selects/textarea — accent focus within left panel only */
-.gradio-container .main > .container > .grid > :first-child input:focus,
+.gradio-container .main > .container > .grid > :first-child input:focus {
+},
 .gradio-container .main > .container > .grid > :first-child textarea:focus,
 .gradio-container .main > .container > .grid > :first-child select:focus{
   outline:2px solid var(--accent)!important; outline-offset:2px!important; box-shadow:0 0 0 3px var(--lp-ring)!important;
