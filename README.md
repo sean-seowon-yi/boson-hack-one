@@ -29,14 +29,14 @@ Follow the steps below to install.
 
 ### 1. Clone the Repository
 
-First, clone the `boson-hack-one` repository to your local machine and initialize submodules.
+First, clone the `pentalingual` repository to your local machine and initialize submodules.
 
 ```bash
 # Clone the project to your local machine
-git clone https://github.com/sean-seowon-yi/boson-hack-one
+git clone https://github.com/sean-seowon-yi/pentalingual
 
 # Navigate to the project directory
-cd boson-hack-one
+cd pentalingual
 
 # Initialize and update submodule
 git submodule update --init --recursive
@@ -48,13 +48,13 @@ Before proceeding, please create a new Python environment and install the requir
 
 ```bash
 # Create a conda environment named 'boson_hack' and specify Python version 3.10
-conda create -n boson_hack python=3.10 -y
+conda create -n pentalingual python=3.10 -y
 
 # Activate the newly created environment
-conda activate boson_hack
+conda activate pentalingual
 
 # Navigate to the project directory
-cd boson-hack-one/
+cd pentalingual/
 
 # Install the ffmpeg tool
 # Install ffmpeg using conda
@@ -130,6 +130,11 @@ python webui.py
 
 **Qwen** is a localized large language model that supports multi-language translation. Although its performance may not match OpenAI's top models, its open-source nature and local execution make it a cost-effective option. Qwen is capable of handling text translations across various languages and serves as a powerful open-source alternative. 
 
+### Text to Speech
+
+#### XTTS
+
+**XTTS** (Cross-lingual Text-to-Speech) is an advanced multilingual, multi-speaker TTS model designed to generate natural, expressive, and high-quality speech across a wide range of languages and accents. Developed as part of the Coqui TTS ecosystem, XTTS builds upon the Tacotron and VITS architectures, integrating a cross-lingual transfer mechanism that allows it to reproduce speaker identity and emotional tone even in languages the speaker never explicitly recorded. The model supports zero-shot voice cloning — users can synthesize speech in any supported language using only a short reference audio clip of the target speaker. 
 
 ### Key Features
 1. **Multi-language support**: Handles speech synthesis tasks in various languages.
