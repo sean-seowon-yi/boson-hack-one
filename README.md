@@ -158,6 +158,12 @@ Follows the Apache License 2.0. When using this tool, please comply with relevan
 
 ---
 
+## Credit
+
+Our project was inspired by Linly-Dubbing and further optimized for the purpose of intelligent multi-language AI dubbing and translation.
+
+---
+
 ## References
 
 In developing this project, I referenced and drew inspiration from several outstanding open-source projects and related resources. Special thanks to the developers and contributors of these projects and the open-source community. Below are the main projects we referenced:
