@@ -56,6 +56,10 @@ conformer==0.3.2
 WeTextProcessing==1.0.3
 HyperPyYAML==1.2.2
 
+TTS==0.22.0
+phonemizer>=3.2.1
+pydub
+
 # Optional extras you might enable later:
 # git+https://github.com/m-bain/whisperx.git
 openai
