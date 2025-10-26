@@ -162,7 +162,7 @@ Follows the Apache License 2.0. When using this tool, please comply with relevan
 
 Our project was inspired by Linly-Dubbing and further optimized for the purpose of intelligent multi-language AI dubbing and translation.
 
---
+---
 
 ## References
 
