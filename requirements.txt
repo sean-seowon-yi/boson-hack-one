@@ -131,5 +131,6 @@ gdown==5.1.0
 yt-dlp>=2024.5.27
 openunmix==1.3.0
 
-submodules/demucs
-submodules/TTS
+git+https://github.com/boson-hack-one/demucs@f3ae97c3bc231d3cfd53a4b4d84d87c3c86a5f70
+
+git+https://github.com/boson-hack-one/demucs/TTS@f3ae97c3bc231d3cfd53a4b4d84d87c3c86a5f70
