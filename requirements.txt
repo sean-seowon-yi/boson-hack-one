@@ -58,5 +58,5 @@ HyperPyYAML==1.2.2
 
 # Optional extras you might enable later:
 # git+https://github.com/m-bain/whisperx.git
-# openai
-# translators
+openai
+translators
