@@ -133,7 +133,7 @@ full_auto_interface = gr.Interface(
         gr.Slider(minimum=0, maximum=10, step=1, label="Number of shifts", value=5, visible=False),
 
         # ASR
-        gr.Dropdown(["Higgs", "WhisperX", "FunASR"], label="ASR backend", value="Higgs"),
+        gr.Dropdown(["Higgs"], label="ASR backend", value="Higgs"),
         gr.Radio(["large", "medium", "small", "base", "tiny"], label="WhisperX size", value="large", visible=False),
         gr.Slider(minimum=1, maximum=128, step=1, label="Batch size", value=32, visible=False),
         gr.Checkbox(label="Enable speaker diarization", value=True, visible=False),
@@ -149,7 +149,7 @@ full_auto_interface = gr.Interface(
         ),
 
         # TTS
-        gr.Dropdown(["Higgs", "xtts", "cosyvoice", "EdgeTTS"], label="TTS method", value="Higgs"),
+        gr.Dropdown(["Higgs", "xtts", "cosyvoice"], label="TTS method", value="Higgs"),
         gr.Dropdown(
             ["Chinese (中文)", "English", "Korean", "Spanish", "French"],
             label="TTS target language",
