@@ -70,7 +70,7 @@ python -m pip install -U pip
 python -m pip install uv
 
 # CPU wheels (fast, portable). For GPU, replace the CPU index with --extra-index-url https://download.pytorch.org/whl/cu124
-uv pip install --prefer-binary \
+uv pip install \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   -r requirements.txt
 
