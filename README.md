@@ -68,11 +68,12 @@ conda install ffmpeg==7.0.2 -c conda-forge
 # Install ffmpeg using a domestic mirror
 conda install ffmpeg==7.0.2 -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
 
-# Upgrade pip to the latest version
-python -m pip install --upgrade pip
-
-# Change the PyPI source to speed up package downloads
-pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+# Install using PyTorch’s wheel index + prefer prebuilt binaries + faster resolver
+pip install -U pip
+pip install uv
+uv pip install --system --prefer-binary \
+  --extra-index-url https://download.pytorch.org/whl/cpu \
+  -r requirements.txt
 ```
 
 
@@ -82,7 +83,6 @@ pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 conda install -y pynini==2.1.5 -c conda-forge
 # -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
 
-pip install -r requirements.txt
 # Install dependencies for submodules
 pip install -r requirements_module.txt
 ```
