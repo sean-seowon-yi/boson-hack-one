@@ -1,3 +1,6 @@
+# --- Index hint for fast PyTorch wheels ---
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # --- Core runtime / serving ---
 gradio>=4.0
 fastapi>=0.115
@@ -5,7 +8,7 @@ uvicorn[standard]>=0.30
 huggingface_hub>=0.24
 python-dotenv>=1.0
 
-# --- PyTorch trio (CPU-friendly) ---
+# --- PyTorch trio (CPU wheels via extra index) ---
 torch==2.3.1
 torchaudio==2.3.1
 torchvision==0.18.1
@@ -16,60 +19,60 @@ scipy>=1.11
 scikit-learn>=1.3
 pandas>=2.2
 matplotlib>=3.8
-numba>=0.59
-llvmlite>=0.43
 tqdm>=4.66
 einops>=0.7
 protobuf>=4.24
 safetensors>=0.4.3
 
-# --- NLP / Transformers / Whisper ---
-transformers==4.55.4
-tokenizers>=0.15
-sentencepiece>=0.1.99
-#faster-whisper==1.2.0
-#whisperx==3.7.4
-#whisper==1.1.10
-nltk>=3.9
-regex>=2024.9.11
-
-# --- Audio / TTS / ASR toolchain ---
+# numba/librosa combo (compatible pair)
+numba==0.57.1
+llvmlite==0.40.1
+librosa==0.10.2.post1
 soundfile>=0.12
 audioread>=3.0.1
 soxr>=0.3.7
 ffmpeg-python>=0.2.0
 pydub>=0.25.1
 audiostretchy==1.3.5
+
+# --- NLP / Transformers ---
+transformers==4.55.4
+tokenizers>=0.15
+sentencepiece>=0.1.99
+nltk>=3.9
+regex>=2024.9.11
+
+# --- Separation / enhancement (keep one set) ---
 demucs==4.0.1
 openunmix==1.3.0
 asteroid-filterbanks==0.4.0
 pytorch-wpe==0.0.1
 speechbrain==1.0.3
+
+# --- TTS / ASR backends ---
 coqui-tts==0.27.2
 coqpit-config==0.2.1
 ttsfrd==0.1.0
 edge-tts==7.2.3
-librosa==0.11.0
-soxr>=0.3.7
 
-# --- Diffusion / audio codecs (if you actually use them) ---
-diffusers==0.27.2
-encodec==0.1.1
+# --- Diffusion / codecs (optional; move to extras if slow) ---
+# diffusers==0.27.2
+# encodec==0.1.1
 
-# --- Model management / orchestration ---
+# --- Orchestration (optional; comment out one of these families) ---
+# lightning==2.5.5
+pytorch-lightning==2.5.5
+torchmetrics==1.3.2
 accelerate==1.11.0
 hydra-core==1.3.2
 omegaconf==2.3.0
-lightning==2.5.5
-pytorch-lightning==2.5.5
-torchmetrics==1.3.2
 
-# --- PyAnnote (diarization) ---
-pyannote.audio==3.4.0
-pyannote.core==5.0.0
-pyannote.database==5.1.3
-pyannote.metrics==3.2.1
-pyannote.pipeline==3.0.1
+# --- PyAnnote (very heavy; consider extras) ---
+# pyannote.audio==3.4.0
+# pyannote.core==5.0.0
+# pyannote.database==5.1.3
+# pyannote.metrics==3.2.1
+# pyannote.pipeline==3.0.1
 
 # --- OpenAI / HTTP clients ---
 openai==1.55.3
@@ -122,15 +125,9 @@ python-dateutil>=2.8.2
 pytz>=2024.1
 tzlocal>=5.2
 PyYAML>=6.0.1
-regex>=2024.9.11
 
-# --- Optional (comment out if not needed) ---
+# --- Optional utilities ---
 onnxruntime==1.23.1
 translators==6.0.1
 gdown==5.1.0
 yt-dlp>=2024.5.27
-openunmix==1.3.0
-
-demucs>=4.0.0 
-
-TTS 
