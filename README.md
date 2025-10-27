@@ -13,11 +13,11 @@ sdk_version: 5.49.1
 
 Key features include:
 
-- **Multi-language Support**: Offers dubbing and subtitle translation in Chinese and many other languages.
+- **Multi-language Support**: Offers dubbing and subtitle translation in English, Chinese, Korean, French, and Spanish.
 - **AI Speech Recognition**: Employs advanced AI for speech-to-text conversion and speaker recognition.
 - **Large Language Model Translation**: Uses leading language models like Qwen for fast and accurate translations.
 - **AI Voice Cloning**: Utilizes voice cloning to generate speech closely matching the original video's tone and emotion.
-- **Digital Human Lip-Sync Technology**: Synchronizes dubbing with video visuals, enhancing realism.
+- **Digital Sync Technology**: Synchronizes dubbing with video visuals, enhancing realism.
 - **Flexible Upload and Translation**: Users can upload videos, choose translation languages, and standards.
 
 ---
