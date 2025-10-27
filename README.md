@@ -142,6 +142,10 @@ python webui.py
 
 **XTTS** (Cross-lingual Text-to-Speech) is an advanced multilingual, multi-speaker TTS model designed to generate natural, expressive, and high-quality speech across a wide range of languages and accents. Developed as part of the Coqui TTS ecosystem, XTTS builds upon the Tacotron and VITS architectures, integrating a cross-lingual transfer mechanism that allows it to reproduce speaker identity and emotional tone even in languages the speaker never explicitly recorded. The model supports zero-shot voice cloning — users can synthesize speech in any supported language using only a short reference audio clip of the target speaker. 
 
+#### Higgs
+
+**Higgs** an open-source text-to-audio foundation model pretrained on over ten million hours of diverse audio paired with large-scale text data, built to deliver high-fidelity, expressive speech (including multi-speaker, multilingual, and voice-cloned output) via a unified architecture. It employs a custom audio tokenizer capturing both semantic and acoustic tokens, and a “Dual-FFN” transformer-based backbone to efficiently model long acoustic sequences while maintaining strong language understanding. The model supports zero-shot voice cloning (i.e., generating audio in a reference speaker’s voice without speaker-specific fine-tuning) and multi-speaker dialogue generation, achieving state-of-the-art results
+
 ### Key Features
 1. **Multi-language support**: Handles speech synthesis tasks in various languages.
 2. **Multi-style speech synthesis**: Controls the emotion and tone of speech through commands.
