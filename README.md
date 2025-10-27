@@ -43,9 +43,6 @@ git clone https://github.com/sean-seowon-yi/pentalingual
 
 # Navigate to the project directory
 cd pentalingual
-
-# Initialize and update submodule
-git submodule update --init --recursive
 ```
 
 ### 2. Install Dependencies
