@@ -53,40 +53,33 @@ git submodule update --init --recursive
 Before proceeding, please create a new Python environment and install the required dependencies.
 
 ```bash
-# Create a conda environment named 'boson_hack' and specify Python version 3.10
+# Create a conda environment named 'pentalingual' and specify Python version 3.10
 conda create -n pentalingual python=3.10 -y
 
 # Activate the newly created environment
 conda activate pentalingual
 
-# Navigate to the project directory
-cd pentalingual/
-
 # Install the ffmpeg tool
 # Install ffmpeg using conda
-conda install ffmpeg==7.0.2 -c conda-forge
-# Install ffmpeg using a domestic mirror
-conda install ffmpeg==7.0.2 -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
+conda install -y -c conda-forge ffmpeg==7.0.2
+# Install ffmpeg using a mirror
+# conda install -y -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/ ffmpeg==7.0.2
 
-# Install using PyTorch’s wheel index + prefer prebuilt binaries + faster resolver
-pip install -U pip
-pip install uv
-uv pip install --system --prefer-binary \
+# Pynini (needed by WeTextProcessing) — conda is the hassle-free route
+conda install -y -c conda-forge pynini==2.1.5
+
+# Fast pip resolver + prebuilt wheels
+python -m pip install -U pip
+python -m pip install uv
+
+# CPU wheels (fast, portable). For GPU, replace the CPU index with --extra-index-url https://download.pytorch.org/whl/cu124
+uv pip install --prefer-binary \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   -r requirements.txt
-```
 
-
-```bash
-# Install the required Python packages for the project
-# pynini is required by WeTextProcessing, so use conda to install it as it works across all platforms.
-conda install -y pynini==2.1.5 -c conda-forge
-# -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
-
-# Install dependencies for submodules
+# Submodule-specific requirements
 pip install -r requirements_module.txt
 ```
-
 
 ### 3. Configure Environment Variables
 
