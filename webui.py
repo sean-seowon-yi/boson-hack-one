@@ -464,7 +464,7 @@ demo = gr.Interface(
         gr.Video(label="Translated video"),
         gr.HTML(label="Original video (YouTube)"),
     ],
-    flagging_mode="never",
+    allow_flagging="never",
 )
 
 CUSTOM_CSS = """

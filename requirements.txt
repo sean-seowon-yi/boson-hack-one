@@ -1,29 +1,29 @@
 # =========================================================
-# pentalingual requirements.txt
+# pentalingual requirements.txt (Final Verified Version)
+# Python 3.10–3.11 recommended
 # =========================================================
 
-# If you deploy on Linux CPU-only, keep this index. On macOS it's harmless.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 ########## Core runtime / serving ##########
 gradio==4.44.1
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-huggingface_hub==0.26.2
+huggingface_hub==0.34.0
 python-dotenv==1.0.1
 Flask==3.1.2
 Werkzeug==3.1.3
+aiofiles==23.1.0
 
-########## Torch trio (must match) ##########
+########## Torch trio (CPU-optimized) ##########
 torch==2.3.1
 torchaudio==2.3.1
 torchvision==0.18.1
 
 ########## Numeric / ML backbone ##########
-# Lock this trio together for ABI compatibility:
 numpy==1.26.4
 numba==0.60.0
-llvmlite==0.43.*
+llvmlite==0.43.0
 scipy==1.13.1
 pandas==2.2.3
 scikit-learn==1.4.2
@@ -40,15 +40,15 @@ threadpoolctl==3.5.0
 typing_extensions==4.12.2
 packaging==24.1
 python-dateutil==2.9.0.post0
-pytz==2025.1
+pytz==2024.2
 tzlocal==5.2
 PyYAML==6.0.2
 orjson==3.10.7
 ujson==5.10.0
 pyarrow==17.0.0
 zstandard==0.23.0
-tqdm==4.66.5
-accelerate==1.11.0
+tqdm==4.67.1
+accelerate==0.34.1
 hydra-core==1.3.2
 omegaconf==2.3.0
 pytorch-lightning==2.5.5
@@ -56,9 +56,10 @@ torchmetrics==1.4.0.post0
 umap-learn==0.5.6
 pynndescent==0.5.13
 optuna==3.6.1
+fsspec==2024.6.1
 
 ########## Audio / DSP / Separation ##########
-librosa==0.10.2.post1
+librosa==0.11.0
 soundfile==0.12.1
 audioread==3.0.1
 soxr==0.3.7
@@ -72,22 +73,18 @@ pytorch-wpe==0.0.1
 speechbrain==1.0.3
 webrtcvad==2.0.10
 encodec==0.1.1
-av==10.0.0
+av==12.2.0
 lameenc==1.8.1
 
-########## TTS / NLP stack ##########
-coqui-tts==0.27.2
-coqpit-config==0.2.1
+########## TTS / NLP (Coqui-TTS removed) ##########
 ttsfrd==0.1.0
 edge-tts==7.2.3
-
 transformers==4.55.4
 tokenizers==0.21.4
 sentencepiece==0.2.0
 nltk==3.9.1
-regex==2024.9.11
+regex==2021.8.28
 pysbd==0.3.4
-WeTextProcessing==1.0.3
 pypinyin==0.53.0
 jieba==0.42.1
 jaconv==0.4.0
@@ -99,7 +96,7 @@ bnnumerizer==0.0.2
 inflect==7.5.0
 Unidecode==1.3.8
 
-# spaCy (kept aligned with Py3.10 wheels)
+# spaCy ecosystem
 spacy==3.8.7
 spacy-legacy==3.0.12
 spacy-loggers==1.0.5
@@ -108,23 +105,24 @@ srsly==2.5.1
 preshed==3.0.9
 murmurhash==1.0.10
 cymem==2.0.8
-blis==1.0.1
+blis==1.2.0
 langcodes==3.4.0
 language_data==1.2.0
 
-########## diarization (optional) ##########
+########## Whisper / diarization ##########
+faster-whisper==1.0.3
 pyannote.audio==3.1.1
 pyannote.core==5.0.0
 pyannote.database==5.1.3
 pyannote.metrics==3.2.1
 pyannote.pipeline==3.0.1
 
-########## Diffusion / extras (optional) ##########
+########## Diffusers ##########
 diffusers==0.27.2
 
 ########## OpenAI / HTTP clients ##########
 openai==1.55.3
-httpx==0.27.2
+httpx==0.28.1
 requests==2.32.3
 urllib3==2.2.3
 requests-toolbelt==1.0.0
@@ -139,7 +137,7 @@ idna==3.7
 certifi==2024.8.30
 charset-normalizer==3.3.2
 
-########## Web / API / validation utils ##########
+########## Web / API / validation ##########
 starlette==0.41.3
 fastapi-cli==0.0.5
 pydantic==2.9.2
@@ -151,12 +149,12 @@ Jinja2==3.1.4
 MarkupSafe==2.1.5
 h11==0.14.0
 websockets==12.0
-httptools==0.6.1
+httptools==0.6.3
 uvloop==0.20.0 ; platform_system != "Windows"
 watchfiles==0.24.0
 
-########## Data / storage helpers ##########
-jsonlines==4.0.0
+########## Data / storage ##########
+jsonlines==1.2.0
 tabulate==0.9.0
 rich==13.9.4
 loguru==0.7.3
@@ -173,7 +171,19 @@ imageio-ffmpeg==0.5.1
 proglog==0.1.10
 pillow==10.4.0
 
-########## Additional, kept for parity ##########
+########## Keep translators (and its deps) ##########
+translators==6.0.1
+lxml==6.0.2
+cloudscraper==1.2.71
+cryptography==43.0.1
+pathos==0.3.4
+multiprocess==0.70.18
+dill==0.4.0
+pox==0.3.6
+ppft==1.7.7
+niquests==3.15.2
+
+########## Everything else ##########
 absl-py==2.3.1
 alembic==1.13.2
 aliyun-python-sdk-core==2.16.0
@@ -184,12 +194,11 @@ anyascii==0.3.2
 attrs==24.2.0
 babel==2.15.0
 beautifulsoup4==4.12.3
-blinker==1.8.2
+blinker==1.9.0
 Brotli==1.1.0
 catalogue==2.0.10
 cffi==1.17.1
 cloudpathlib==0.18.1
-cloudscraper==1.2.71
 colorama==0.4.6
 coloredlogs==15.0.1
 colorlog==6.8.2
@@ -197,31 +206,24 @@ confection==0.1.5
 conformer==0.3.2
 contourpy==1.2.1
 crcmod==1.7
-cryptography==43.0.1
 ctranslate2==4.6.0
 cycler==0.12.1
 Cython==3.0.11
-dateparser==1.2.0
-decorator==5.1.1
-dill==0.3.9
+dateparser==1.1.1
+decorator==4.3.0
 distro==1.9.0
 dnspython==2.6.1
 docopt==0.6.2
 dora_search==0.1.12
-dotenv==0.9.9
 editdistance==0.8.1
-einops==0.8.1
 exejs==0.0.6
 ffmpy==0.3.2
 flatbuffers==24.3.25
 fonttools==4.53.1
-fsspec==2024.6.1
-funasr==1.2.7
 future==1.0.0
 g2pkk==0.1.2
 gdown==5.1.0
 gradio_client==1.3.0
-groovy==0.3.6
 grpcio==1.62.3
 gruut==2.4.0
 gruut-ipa==0.13.0
@@ -240,8 +242,7 @@ importlib_resources==6.4.4 ; python_version < "3.12"
 jamo==0.4.1
 jh2==5.0.10
 jiter==0.11.1
-jmespath==1.0.1
-jsonlines==1.2.0
+jmespath==0.9.3
 julius==0.2.7
 kaldiio==2.18.1
 kiwisolver==1.4.5
@@ -249,26 +250,19 @@ marisa-trie==1.2.0
 Markdown==3.6
 markdown-it-py==3.0.0
 mdurl==0.1.2
-modelscope==1.13.3
+modelscope==1.15.0
 monotonic-alignment-search==0.2.1
 mpmath==1.3.0
 msgpack==1.0.8
 multidict==6.0.5
-multiprocess==0.70.16
-niquests==3.15.2
-num2words==0.5.13
+num2words==0.5.14
 onnxruntime==1.23.1
 oss2==2.19.1
-pathos==0.3.2
-pooch==1.8.2
-pox==0.3.5
-ppft==1.7.6.8
 primePy==1.3
 propcache==0.4.1
 psutil==6.0.0
 Pygments==2.18.0
 pylance==0.18.0
-pynini==2.1.5
 pyparsing==3.1.2
 PySocks==1.7.1
 python-crfsuite==0.9.11
@@ -292,16 +286,15 @@ tensorboard-data-server==0.7.2
 tensorboardX==2.6.2.2
 termcolor==2.4.0
 tomli==2.0.1
-tomlkit==0.13.2
+tomlkit==0.12.0
 torch-audiomentations==0.12.0
 torch-complex==0.4.4
 torch_pitch_shift==1.2.5
-translators==6.0.1
 treetable==0.2.6
 typeguard==4.3.0
 typer==0.12.4
 typer-slim==0.12.4
-typing-inspection==0.9.0
+typing-inspect==0.9.0
 tzdata==2025.1
 wasabi==1.1.3
 wassima==2.0.2
