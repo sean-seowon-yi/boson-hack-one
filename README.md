@@ -67,12 +67,9 @@ conda install -y -c conda-forge pynini==2.1.5
 
 # Fast pip resolver + prebuilt wheels
 python -m pip install -U pip
-python -m pip install uv
 
-# CPU wheels (fast, portable). For GPU, replace the CPU index with --extra-index-url https://download.pytorch.org/whl/cu124
-uv pip install \
-  --extra-index-url https://download.pytorch.org/whl/cpu \
-  -r requirements.txt
+# Install requirements
+pip install -r requirements.txt
 
 # Submodule-specific requirements
 pip install -r requirements_module.txt
