@@ -1,1 +1,1 @@
-python scripts/modelscope_download.py
+python scripts/huggingface_download.py

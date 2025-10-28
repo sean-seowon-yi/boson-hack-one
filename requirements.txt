@@ -76,10 +76,10 @@ encodec==0.1.1
 av==12.2.0
 lameenc==1.8.1
 
-########## TTS / NLP (Coqui-TTS removed) ##########
+########## TTS / NLP ##########
 ttsfrd==0.1.0
 edge-tts==7.2.3
-transformers==4.55.4
+transformers<4.50
 tokenizers==0.21.4
 sentencepiece==0.2.0
 nltk==3.9.1
@@ -300,5 +300,5 @@ wassima==2.0.2
 weasel==0.4.1
 wget==3.2
 wrapt==1.16.0
-yt-dlp==2024.8.6
+yt-dlp==2025.10.22
 zipp==3.20.2

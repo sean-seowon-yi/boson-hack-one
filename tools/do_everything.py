@@ -22,14 +22,14 @@ import time
 import traceback
 import shutil
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from loguru import logger
 
 from .step000_video_downloader import (
     get_info_list_from_url,
-    download_single_video,
+    download_single_video,   # optionally accepts target_folder=... (fallback handled)
     get_target_folder,
 )
 from .step010_demucs_vr import separate_all_audio_under_folder, init_demucs, release_model
@@ -64,7 +64,7 @@ _TRANSLATION_ALIASES = {
 _TTS_ALIASES = {
     "chinese (中文)": "zh-cn", "中文": "zh-cn", "chinese": "zh-cn", "zh": "zh-cn", "zh-cn": "zh-cn",
     "english": "en", "en": "en",
-    "korean": "ko", "韩国语": "ko", "한국어": "ko", "ko": "ko",
+    "korean": "ko", "韩国语": "ko", "韩国": "ko", "한국어": "ko", "ko": "ko",
     "spanish": "es", "español": "es", "es": "es",
     "french": "fr", "français": "fr", "fr": "fr",
 }
@@ -149,7 +149,7 @@ def _extract_author(info, author_override: Optional[str]) -> str:
 
 def _compose_author_title_folder(
     root_folder: str,
-    base_folder: str,
+    base_folder: Optional[str],
     title: str,
     author: str,
     lang_code: str,
@@ -159,7 +159,8 @@ def _compose_author_title_folder(
 ) -> str:
     """
     Create: <root>/<author>/<language>_<emotion>_<short_title>_<ttsmodel>
-    Move contents of base_folder into the child folder.
+    If base_folder is provided and different, merge contents and remove base_folder.
+    If base_folder is None, just create/return the final path.
     """
     author_dir = os.path.join(root_folder, _slugify_component(author or "local"))
     os.makedirs(author_dir, exist_ok=True)
@@ -177,8 +178,8 @@ def _compose_author_title_folder(
         shutil.rmtree(child_path, ignore_errors=True)
     os.makedirs(child_path, exist_ok=True)
 
-    # Move/copy everything from the temporary base folder into the final child folder
-    if os.path.abspath(base_folder) != os.path.abspath(child_path) and os.path.isdir(base_folder):
+    # Only consolidate if a staging folder actually exists
+    if base_folder and os.path.abspath(base_folder) != os.path.abspath(child_path) and os.path.isdir(base_folder):
         for name in os.listdir(base_folder):
             src = os.path.join(base_folder, name)
             dst = os.path.join(child_path, name)
@@ -194,10 +195,7 @@ def _compose_author_title_folder(
                         os.remove(src)
                     except Exception:
                         pass
-        try:
-            os.rmdir(base_folder)
-        except Exception:
-            pass
+        shutil.rmtree(base_folder, ignore_errors=True)
 
     return child_path
 
@@ -242,6 +240,42 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
 # ---------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------
+def _compute_final_folder_from_info(
+    info,
+    root_folder: str,
+    tts_target_language: str,
+    emotion: str,
+    tts_method: str,
+    author_override: Optional[str],
+) -> Tuple[str, str, str]:
+    """
+    Returns (final_folder_path, author, raw_title).
+    Computes the final folder BEFORE any download so we can write into place.
+    """
+    # Determine title / author
+    if isinstance(info, dict):
+        raw_title = info.get("title") or "untitled"
+    elif isinstance(info, str) and info.endswith(".mp4"):
+        raw_title = os.path.splitext(os.path.basename(info))[0]
+    else:
+        raw_title = "untitled"
+
+    author = _extract_author(info if isinstance(info, dict) else {}, author_override)
+    tts_lang_code = _norm_tts_lang(tts_target_language)
+
+    # Create the final folder (no staging yet)
+    final_folder = _compose_author_title_folder(
+        root_folder=root_folder,
+        base_folder=None,  # IMPORTANT: no staging provided; just create target
+        title=raw_title,
+        author=author,
+        lang_code=tts_lang_code,
+        emotion=emotion,
+        tts_model=tts_method,
+        overwrite=True,
+    )
+    return final_folder, author, raw_title
+
 def process_video(
     info,
     root_folder,
@@ -291,50 +325,55 @@ def process_video(
 
     for retry in range(max_retries):
         try:
-            # Stage: Download
+            # Stage: Download (but first compute final folder so we can download into it)
             stage_name, stage_weight = stages[current_stage]
             if progress_callback:
                 progress_callback(progress_base, stage_name)
 
-            if isinstance(info, str) and info.endswith(".mp4"):
-                original_file_name = os.path.basename(info)
-                base_folder_name = os.path.splitext(original_file_name)[0]
-                base_folder = os.path.join(root_folder, base_folder_name)
-                os.makedirs(base_folder, exist_ok=True)
-                dest_path = os.path.join(base_folder, "download.mp4")
-                shutil.copy2(info, dest_path)
-            else:
-                base_folder = get_target_folder(info, root_folder)
-                if base_folder is None:
-                    error_msg = f'Unable to derive target folder: {info.get("title") if isinstance(info, dict) else info}'
-                    logger.warning(error_msg)
-                    return False, None, error_msg
-                base_folder = download_single_video(info, root_folder, resolution)
-                if base_folder is None:
-                    error_msg = f'Download failed: {info.get("title") if isinstance(info, dict) else info}'
-                    logger.warning(error_msg)
-                    return False, None, error_msg
-
-            # Compose final working folder:
-            # <root>/<author>/<language>_<emotion>_<short_title>_<ttsmodel>
-            author = _extract_author(info, author_override)
-            raw_title = info.get("title") if isinstance(info, dict) else os.path.basename(base_folder)
-            tts_lang_code = _norm_tts_lang(tts_target_language)
-
-            folder = _compose_author_title_folder(
+            final_folder, author, raw_title = _compute_final_folder_from_info(
+                info=info,
                 root_folder=root_folder,
-                base_folder=base_folder,
-                title=raw_title,
-                author=author,
-                lang_code=tts_lang_code,
+                tts_target_language=tts_target_language,
                 emotion=emotion,
-                tts_model=tts_method,
-                overwrite=True,  # enforce overwrite on duplicates
+                tts_method=tts_method,
+                author_override=author_override,
             )
             logger.info(
-                f"Processing folder: {folder} "
-                f"(author='{author}', lang={tts_lang_code}, emotion={emotion}, tts={tts_method})"
+                f"Processing folder: {final_folder} "
+                f"(author='{author}', emotion={emotion}, tts={tts_method})"
             )
+
+            # Download/copy directly into final_folder, avoiding staging when possible
+            if isinstance(info, str) and info.endswith(".mp4"):
+                os.makedirs(final_folder, exist_ok=True)
+                dest_path = os.path.join(final_folder, "download.mp4")
+                shutil.copy2(info, dest_path)
+            else:
+                # Preferred path: downloader supports target_folder
+                try:
+                    _ = download_single_video(info, root_folder, resolution, target_folder=final_folder)  # type: ignore
+                except TypeError:
+                    # Legacy downloader: returns a staging folder; consolidate then remove staging
+                    base_folder = download_single_video(info, root_folder, resolution)
+                    if os.path.abspath(base_folder) != os.path.abspath(final_folder):
+                        for name in os.listdir(base_folder):
+                            src = os.path.join(base_folder, name)
+                            dst = os.path.join(final_folder, name)
+                            try:
+                                shutil.move(src, dst)
+                            except Exception:
+                                if os.path.isdir(src):
+                                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                                    shutil.rmtree(src, ignore_errors=True)
+                                else:
+                                    shutil.copy2(src, dst)
+                                    try:
+                                        os.remove(src)
+                                    except Exception:
+                                        pass
+                        shutil.rmtree(base_folder, ignore_errors=True)
+
+            folder = final_folder  # continue using the final path as the single working folder
 
             # Stage: Vocal separation
             current_stage += 1; progress_base += stage_weight
