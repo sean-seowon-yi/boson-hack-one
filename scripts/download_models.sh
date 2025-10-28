@@ -1,0 +1,1 @@
+python scripts/modelscope_download.py

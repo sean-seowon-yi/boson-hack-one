@@ -37,7 +37,6 @@ from .step020_asr import transcribe_all_audio_under_folder
 from .step030_translation import translate_all_transcript_under_folder
 from .step040_tts import generate_all_wavs_under_folder
 from .step042_tts_xtts import init_TTS
-from .step043_tts_cosyvoice import init_cosyvoice
 from .step050_synthesize_video import synthesize_all_video_under_folder
 from .step047_emotion_auto_batch import auto_tune_emotion_all_wavs_under_folder
 
@@ -222,11 +221,6 @@ def initialize_models(tts_method: str, asr_method: str, diarization: bool) -> No
                     futures.append(executor.submit(init_TTS))
                     models_initialized["xtts"] = True
                     logger.info("Initialized XTTS")
-            elif tts_method == "cosyvoice":
-                if not models_initialized["cosyvoice"]:
-                    futures.append(executor.submit(init_cosyvoice))
-                    models_initialized["cosyvoice"] = True
-                    logger.info("Initialized CosyVoice")
             elif tts_method == "Higgs":
                 logger.info("TTS 'Higgs' selected — API-based")
 

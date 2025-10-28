@@ -167,10 +167,7 @@ In developing this project, I referenced and drew inspiration from several outst
 
 - [YouDub-webui](https://github.com/liuzhao1225/): Provides a feature-rich web interface for downloading and processing YouTube videos, from which we drew much inspiration and technical implementation details.
 
-- [Coqui TTS](https://github.com/coqui-ai/TTS)
 - [Qwen](https://github.com/QwenLM/Qwen)
-- [FunASR](https://github.com/alibaba-damo-academy/FunASR)
-- [CosyVoice](https://github.com/FunAudioLLM/CosyVoice)
 - [Linly-Talker](https://github.com/Kedreamix/Linly-Talker)
 
 ---

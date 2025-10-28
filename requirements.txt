@@ -250,7 +250,6 @@ marisa-trie==1.2.0
 Markdown==3.6
 markdown-it-py==3.0.0
 mdurl==0.1.2
-modelscope==1.15.0
 monotonic-alignment-search==0.2.1
 mpmath==1.3.0
 msgpack==1.0.8

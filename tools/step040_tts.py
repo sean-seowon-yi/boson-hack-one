@@ -2,7 +2,7 @@
 """
 TTS synthesis pipeline (per-line => stitched track)
 - Language-aware text preprocessing (Chinese-only normalizations gated by target language)
-- Backend dispatch to XTTS / CosyVoice / EdgeTTS / Higgs
+- Backend dispatch to XTTS / EdgeTTS / Higgs
 - Precise timing via time-stretch with bounds
 - Deterministic language support checks with unified language codes
 - Optional per-line emotion injection (post-stretch, pre-concatenate)
@@ -22,7 +22,6 @@ from audiostretchy.stretch import stretch_audio
 
 # TTS backends (each must expose: tts(text, output_path, speaker_wav, ...))
 from .step042_tts_xtts import tts as xtts_tts
-from .step043_tts_cosyvoice import tts as cosyvoice_tts
 from .step044_tts_edge_tts import tts as edge_tts
 # Higgs/Boson TTS (OpenAI-compatible)
 from .step041_tts_higgs import tts as higgs_tts
@@ -152,14 +151,12 @@ def adjust_audio_length(
 tts_support_languages = {
     'xtts':      {'zh-cn', 'en', 'ko', 'es', 'fr'},
     'EdgeTTS':   {'zh-cn', 'en', 'ko', 'es', 'fr'},
-    'cosyvoice': {'zh-cn', 'en', 'ko', 'es', 'fr'},
     'Higgs':     {'zh-cn', 'en', 'ko', 'es', 'fr'},
 }
 
 _BACKEND_LANG_ADAPTER = {
     'xtts': {},
     'EdgeTTS': {},
-    'cosyvoice': {},
     'Higgs': {},
 }
 
@@ -202,8 +199,6 @@ def _synthesize_one_line(method: str, text: str, out_path: str, speaker_wav: str
 
     if method == 'xtts':
         xtts_tts(text, out_path, speaker_wav, target_language=lang)
-    elif method == 'cosyvoice':
-        cosyvoice_tts(text, out_path, speaker_wav, target_language=lang)
     elif method == 'EdgeTTS':
         edge_tts(text, out_path, target_language=lang, voice=voice)
     elif method == 'Higgs':
