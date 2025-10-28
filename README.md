@@ -101,7 +101,7 @@ bash scripts/download_models.sh
 Once the download is complete, launch the WebUI interface using the following command:
 
 ```bash
-python webui.py
+uvicorn webui:app --host 127.0.0.1 --port 6006
 ```
 
 
