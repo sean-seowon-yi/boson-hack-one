@@ -6,7 +6,11 @@ sdk_version: 5.49.1
 ---
 # Intelligent Multi-language AI Dubbing/Translation Tool
 
+## Demo Video
 
+NOTE: The UI and features went through some upgrades since the demo video
+
+[![Demo Video](https://img.youtube.com/vi/NYn02HSE_EA/maxresdefault.jpg)](https://www.youtube.com/watch?v=NYn02HSE_EA)
 
 ## Introduction
 
