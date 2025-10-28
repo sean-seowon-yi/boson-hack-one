@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 tools/step050_synthesize_video.py
-Stable web-playback + dynamic subtitles:
-- Atomic ffmpeg writes (temp -> os.replace)
-- Output path is ALWAYS the last ffmpeg arg
-- Subtitle font size & margins scale by resolution (mode: height/width/auto)
-- Width-aware line wrapping so subtitles always fit on screen
-- Bottom-centered alignment with safe margins
-- -shortest and +faststart for web playback
-- Unique publish filename per render to avoid stale caches
-- Returns an absolute URL if PUBLIC_BASE_URL is set, else /media/... URL
+
+Stable web-playback + bottom-anchored, auto-fit subtitles:
+- Atomic ffmpeg writes (temp -> os.replace), output path is ALWAYS last arg
+- Two-pass render (+ optional BGM), +faststart for web playback
+- Subtitles (bigger defaults but safe):
+  * Bottom-centered (ASS Alignment=2) with safe bottom/side margins
+  * Font size scales by resolution (env-tunable) with an % height cap
+  * Width-aware wrapping (Latin & CJK)
+  * Per-cue auto-shrink ({\fsN}) if any line would still overflow (min 90% of base)
+- Media publishing:
+  * Unique filename (cache bust **without** query string)
+  * Atomic publish (copy -> fsync -> os.replace), readable perms
 """
 
 import json
@@ -33,9 +36,12 @@ def _atomic_replace(src_path: str, dst_path: str):
     """Atomically replace dst with src (after fsync)."""
     try:
         with open(src_path, "rb") as f:
-            os.fsync(f.fileno())
-    except Exception as e:
-        logger.debug(f"fsync failed (continuing): {e}")
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    except Exception:
+        pass
     os.replace(src_path, dst_path)
 
 def _mktemp_like(path: str, suffix: str = ".part") -> str:
@@ -93,46 +99,45 @@ def _run_ffmpeg_atomic(cmd: list, final_out: str, log_tag: str) -> bool:
 def _compute_subtitle_layout(width: int, height: int, mode: str = "height") -> Tuple[int, int, int, int, int]:
     """
     Returns (font_size, outline, margin_v, margin_lr, max_line_char).
+
+    Bigger by default, still constrained by a cap.
     mode: "height" | "width" | "auto"
     """
     m = (mode or "height").lower()
-    # Base size proportional to frame; conservative defaults
     if m == "width":
-        base_size = width / 100.0         # ~19px @1920 (will be scaled)
+        base_size = width / 82.0
     elif m == "auto":
-        base_size = min(width, height) / 45.0
+        base_size = min(width, height) / 40.0
     else:  # "height"
-        base_size = height / 45.0         # ~24px @1080 before scaling
+        base_size = height / 36.0
 
-    # Optional multiplier via env (e.g., SUB_FONT_SCALE=0.9)
-    scale = float(os.getenv("SUB_FONT_SCALE", "0.95"))
-    font_size = int(round(max(16.0, base_size * scale)))
-    # Hard cap ~9% of height to avoid huge subs
-    font_size = min(font_size, int(height * 0.09))
+    # Global scale + cap (% of height)
+    scale   = float(os.getenv("SUB_FONT_SCALE", "1.10"))        # bigger default
+    cap_pct = float(os.getenv("SUB_FONT_MAX_PCT", "0.085"))      # cap ~8.5% of height
+    font_size = int(round(max(18.0, base_size * scale)))
+    font_size = min(font_size, int(height * cap_pct))
 
     # Outline & margins
-    outline   = max(1, int(round(font_size * 0.12)))   # ~12% of size
-    margin_lr = max(12, int(round(width  * 0.05)))     # 5% side margins
-    margin_v  = max(12, int(round(height * 0.07)))     # 7% bottom margin
+    outline   = max(1, int(round(font_size * 0.12)))            # ~12% of size
+    margin_lr = max(12, int(round(width  * 0.05)))              # 5% sides
+    margin_v  = max(8,  int(round(height * 0.05)))              # 5% bottom margin (keeps it bottom-stuck)
 
-    # Compute wrap width by pixels -> translate to average char count
+    # Wrap width by pixels -> translate to approximate char count
     usable_w    = max(1, width - 2 * margin_lr)
-    # Approx avg glyph width in pixels (works well for Latin & CJK)
-    avg_char_w  = max(1.0, 0.53 * font_size)
+    avg_char_w  = max(1.0, 0.56 * font_size)
     max_line_char = max(8, int(usable_w // avg_char_w))
     return font_size, outline, margin_v, margin_lr, max_line_char
 
 def _wrap_text_by_width(text: str, max_chars: int) -> List[str]:
     """
-    Greedy line wrap constrained by character count (proxy for pixel width).
-    For CJK/no-space languages, slices by run length.
+    Greedy wrap constrained by character count (proxy for pixel width).
+    Handles both spaced and no-space (CJK) text.
     """
     text = (text or "").strip()
     if not text:
         return []
     chunks: List[str] = []
 
-    # If there are spaces, wrap by words
     if " " in text:
         current: List[str] = []
         cur_len = 0
@@ -148,13 +153,12 @@ def _wrap_text_by_width(text: str, max_chars: int) -> List[str]:
         if current:
             chunks.append(" ".join(current))
     else:
-        # No spaces (CJK, hashtags, etc.): slice hard
         for i in range(0, len(text), max_chars):
             chunks.append(text[i:i+max_chars])
 
-    # Keep to a reasonable number of lines; if >3, rebalance to 3
+    # Max 3 lines — rebalance if needed
     if len(chunks) > 3:
-        merged = " ".join(chunks)
+        merged = "".join(chunks)
         per = max(8, int(round(len(merged) / 3.0)))
         chunks = [merged[i:i+per].strip() for i in range(0, len(merged), per)][:3]
 
@@ -163,7 +167,7 @@ def _wrap_text_by_width(text: str, max_chars: int) -> List[str]:
 def split_text(input_data,
                punctuations=['，', '；', '：', '。', '？', '！', '\n', '”']):
     """
-    Keep your original semantic splitting, then we will width-wrap each piece later.
+    Keep the original semantic splitting, then width-wrap each piece later.
     """
     output_data = []
     for item in input_data:
@@ -196,31 +200,83 @@ def split_text(input_data,
             sentence_start = i + 1
     return output_data
 
-def format_timestamp(seconds):
-    millisec = int((seconds - int(seconds)) * 1000)
-    hours, seconds = divmod(int(seconds), 3600)
-    minutes, seconds = divmod(seconds, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:02},{millisec:03}"
+def _ass_escape(s: str) -> str:
+    return (s or "").replace('\\', r'\\').replace('{', r'\{').replace('}', r'\}')
 
-def generate_srt(translation, srt_path, speed_up=1, max_line_char=30):
+def _format_ts_ass(seconds: float) -> str:
+    # ASS uses h:mm:ss.cs (centiseconds)
+    cs = int(round((seconds - int(seconds)) * 100))
+    h = int(seconds) // 3600
+    m = (int(seconds) % 3600) // 60
+    s = int(seconds) % 60
+    return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+
+def _ass_header(font_name: str, base_fs: int, outline: int, margin_l: int, margin_r: int, margin_v: int) -> str:
     """
-    Generates SRT with width-aware wrapping and bottom-aligned rendering (via ASS style later).
+    Bottom-anchored style (Alignment=2)
     """
-    translation = split_text(translation)
-    with open(srt_path, 'w', encoding='utf-8') as f:
-        for i, line in enumerate(translation):
-            start = format_timestamp(line['start'] / max(1e-6, speed_up))
-            end   = format_timestamp(line['end']   / max(1e-6, speed_up))
-            text  = (line.get('translation') or '').strip()
+    return (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1920\n"
+        "PlayResY: 1080\n"
+        "ScaledBorderAndShadow: yes\n"
+        "WrapStyle: 2\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+        "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+        "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+        f"Style: Default,{font_name},{base_fs},&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,"
+        f"0,0,0,0,100,100,0,0,1,{outline},0,2,{margin_l},{margin_r},{margin_v},1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+    )
+
+def generate_ass(translation, ass_path, width, height, base_fs, outline, margin_v, margin_lr, speed_up=1.0):
+    """
+    Generates ASS where each cue is width-wrapped and (if needed) auto-shrunk
+    with per-event {\fsN} so it FITS the usable width. Bottom-centered & margin-aware.
+    """
+    usable_w   = max(1, width - 2*margin_lr)
+    avg_char_w = max(1.0, 0.56 * base_fs)
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(_ass_header("SimHei", base_fs, outline, margin_lr, margin_lr, margin_v))
+
+        items = split_text(translation)
+        for it in items:
+            start = max(0.0, float(it["start"])) / max(1e-6, speed_up)
+            end   = max(start + 0.01, float(it["end"])) / max(1e-6, speed_up)
+            text  = (it.get("translation") or "").strip()
             if not text:
                 continue
 
-            wrapped_lines = _wrap_text_by_width(text, max_line_char)
-            wrapped = "\n".join(wrapped_lines)
+            # initial wrap based on character capacity
+            capacity_chars = max(8, int(usable_w // avg_char_w))
+            lines = _wrap_text_by_width(text, max_chars=capacity_chars)
 
-            f.write(f'{i + 1}\n')
-            f.write(f'{start} --> {end}\n')
-            f.write(f'{wrapped}\n\n')
+            # if any line would still overflow at base size, compute shrink factor
+            longest_px = max((len(line) * avg_char_w) for line in lines) if lines else 0
+            shrink = 1.0
+            if longest_px > usable_w:
+                shrink = max(0.90, usable_w / max(1.0, longest_px))  # floor 90% (bigger subs)
+            else:
+                # slight upscale for very short lines (respecting base cap visually)
+                shrink = min(1.22, usable_w / max(1.0, longest_px)) if longest_px > 0 else 1.0
+
+            per_event_fs = max(14, int(round(base_fs * shrink)))
+
+            payload = r"{\fs" + str(per_event_fs) + "}" + r"\N".join(_ass_escape(l) for l in lines)
+
+            f.write(
+                "Dialogue: 0,{start},{end},Default,,0000,0000,0000,,{text}\n".format(
+                    start=_format_ts_ass(start),
+                    end=_format_ts_ass(end),
+                    text=payload
+                )
+            )
 
 # ---------------------------------------------------------------------
 # Video helpers
@@ -271,6 +327,7 @@ def _web_safe_video_flags(crf='18', preset='veryfast'):
         '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-profile:v', 'high',
         '-level', '4.1', '-preset', str(preset), '-crf', str(crf),
         '-vsync', 'cfr', '-movflags', '+faststart',
+        '-map_metadata', '-1', '-map_chapters', '-1',
     ]
 
 def _web_safe_audio_flags():
@@ -284,16 +341,37 @@ def _escape_for_ass(path: str) -> str:
 # ---------------------------------------------------------------------
 # Publish + URL helpers
 # ---------------------------------------------------------------------
+def _ensure_readable(path: str):
+    try:
+        os.chmod(path, 0o644)
+    except Exception as e:
+        logger.debug(f"chmod 644 failed on {path}: {e}")
+
 def _publish_for_web(final_path: str) -> str:
     """
-    Copy the finished MP4 to a unique, cache-busting filename in the same folder.
+    Create a unique, cache-busting filename via atomic publish:
+      1) Copy to a temp publish path
+      2) fsync temp
+      3) os.replace -> final unique path
     Returns the filesystem path of the published file.
     """
     folder, base = os.path.split(final_path)
     stem, ext = os.path.splitext(base)
     unique = f"{stem}_{int(time.time())}_{uuid.uuid4().hex[:8]}{ext}"
     published = os.path.join(folder, unique)
-    shutil.copy2(final_path, published)
+
+    tmp_pub = _mktemp_like(published, ".publishing")
+    shutil.copy2(final_path, tmp_pub)
+    try:
+        with open(tmp_pub, "rb") as f:
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _ensure_readable(tmp_pub)
+    _atomic_replace(tmp_pub, published)
     return published
 
 def _to_media_url(abs_path: str) -> str:
@@ -301,18 +379,17 @@ def _to_media_url(abs_path: str) -> str:
     Convert an absolute file path under ./videos to a URL.
     If PUBLIC_BASE_URL is set (e.g. http://127.0.0.1:6006), return absolute URL.
     Otherwise, return a relative /media/... path.
-    Always add a cache-busting query.
     """
     videos_root = os.path.abspath("videos")
     ap = os.path.abspath(abs_path)
     rel = os.path.relpath(ap, videos_root).replace("\\", "/")
-    path = "/media/" + urllib.parse.quote(rel)
-    bust = f"?t={int(time.time())}"
+    rel_enc = urllib.parse.quote(rel, safe="/")
+    path = "/media/" + rel_enc
 
     base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
     if base:
-        return f"{base}{path}{bust}"
-    return f"{path}{bust}"
+        return f"{base}{path}"
+    return path
 
 # ---------------------------------------------------------------------
 # Core synthesis
@@ -336,7 +413,7 @@ def synthesize_video(
 
     if not all(os.path.exists(p) for p in [translation_path, input_audio, input_video]):
         logger.error(f"Missing required files in {folder}")
-        return None  # returning None propagates failure to caller
+        return None
 
     with open(translation_path, 'r', encoding='utf-8') as f:
         translation = json.load(f)
@@ -346,17 +423,15 @@ def synthesize_video(
     width, height = convert_resolution(aspect_ratio, resolution)
     resolution_str = f'{width}x{height}'
 
-    # Dynamic subtitle layout (mode via env: height|width|auto)
+    # Dynamic subtitle layout
     sub_mode = os.getenv("SUB_SCALE_MODE", "height")
-    font_size, outline, margin_v, margin_lr, max_line_char = _compute_subtitle_layout(
-        width, height, mode=sub_mode
-    )
+    font_size, outline, margin_v, margin_lr, _ = _compute_subtitle_layout(width, height, mode=sub_mode)
 
-    # Prepare SRT (with dynamic wrap width)
-    srt_path = os.path.join(folder, 'subtitles.srt')
+    # Prepare ASS (per-cue auto-fit)
+    ass_path = os.path.join(folder, 'subtitles.ass')
     final_video = os.path.join(folder, 'video.mp4')
-    generate_srt(translation, srt_path, speed_up, max_line_char=max_line_char)
-    srt_path_ass = _escape_for_ass(srt_path)
+    generate_ass(translation, ass_path, width, height, font_size, outline, margin_v, margin_lr, speed_up=speed_up)
+    ass_path_esc = _escape_for_ass(ass_path)
 
     # Filters
     video_speed_filter = f"setpts=PTS/{max(1e-6, speed_up)}"
@@ -366,26 +441,6 @@ def synthesize_video(
     # Fonts dir
     font_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../font"))
     os.makedirs(font_dir, exist_ok=True)
-
-    # libass style with dynamic sizes/margins:
-    #  - WrapStyle=2 (smart wrapping)
-    #  - Alignment=2 (bottom-center)
-    #  - MarginV / MarginL / MarginR set by resolution
-    style = (
-        f"FontName=SimHei,"
-        f"FontSize={font_size},"
-        f"PrimaryColour=&H00FFFFFF,"        # ARGB little-endian (full white)
-        f"OutlineColour=&H00000000,"        # black outline
-        f"Outline={outline},"
-        f"Shadow=0,"
-        f"BorderStyle=1,"                   # outline (not box)
-        f"Alignment=2,"                     # bottom-center
-        f"WrapStyle=2,"
-        f"LineSpacing=1,"
-        f"MarginV={margin_v},"
-        f"MarginL={margin_lr},"
-        f"MarginR={margin_lr}"
-    )
 
     # Build filtergraph and inputs
     fc_parts = [f"[0:v]{video_speed_filter}[v0]", f"[1:a]{audio_speed_filter},volume={video_volume}[va]"]
@@ -399,7 +454,7 @@ def synthesize_video(
 
     filter_complex = ";".join(fc_parts)
 
-    # PASS 1: main render (no subtitles yet — we burn them in a second pass for clarity)
+    # PASS 1: main render (no subtitles yet — we burn them in a second pass)
     ffmpeg_command = [
         'ffmpeg',
         *input_list,
@@ -439,51 +494,47 @@ def synthesize_video(
         if _run_ffmpeg_atomic(ffmpeg_command_bgm, final_video_with_bgm, "FFmpeg BGM"):
             _atomic_replace(final_video_with_bgm, final_video)
 
-    # PASS 3: subtitle burn-in with dynamic, bottom-aligned style
+    # PASS 3: subtitle burn-in (ASS controls style & bottom anchoring)
     try:
         if subtitles:
             final_video_with_subtitles = final_video.replace('.mp4', '_subtitles.mp4')
-            subtitle_filter = (
-                f"subtitles='{srt_path_ass}':charenc=UTF-8:"
-                f"fontsdir='{_escape_for_ass(font_dir)}':"
-                f"force_style='{style}'"
-            )
-            if add_subtitles(final_video, srt_path_ass, final_video_with_subtitles, subtitle_filter):
+            subtitle_filter = f"subtitles='{ass_path_esc}':fontsdir='{_escape_for_ass(font_dir)}'"
+            if add_subtitles(final_video, ass_path_esc, final_video_with_subtitles, subtitle_filter):
                 _atomic_replace(final_video_with_subtitles, final_video)
     except Exception as e:
         logger.warning(f"Subtitle burn-in failed: {e}")
         traceback.print_exc()
 
-    # Publish with a fresh name (bust caches), then convert to URL
+    # Publish with a fresh name (atomic), then convert to URL
     published_fs_path = _publish_for_web(final_video)
     return _to_media_url(published_fs_path)
 
 # ---------------------------------------------------------------------
 # Subtitle rendering
 # ---------------------------------------------------------------------
-def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, method='ffmpeg'):
+def add_subtitles(video_path, srt_or_ass_path, output_path, subtitle_filter=None, method='ffmpeg'):
+    """
+    Burn-in subtitles using ffmpeg. Accepts .srt or .ass (we pass .ass).
+    """
     try:
         temp_dir = "temp"
         os.makedirs(temp_dir, exist_ok=True)
         temp_video_path = os.path.join(temp_dir, f"temp_video_{random.randint(1000,9999)}.mp4")
-        temp_srt_path = os.path.join(temp_dir, f"temp_srt_{random.randint(1000,9999)}.srt")
+
+        # preserve extension
+        ext = os.path.splitext(srt_or_ass_path)[1]
+        temp_sub_path = os.path.join(temp_dir, f"temp_sub_{random.randint(1000,9999)}{ext}")
         temp_output_path = os.path.join(temp_dir, f"temp_out_{random.randint(1000,9999)}.mp4")
 
         shutil.copyfile(video_path, temp_video_path)
-        shutil.copyfile(srt_path.replace(r"\:", ":"), temp_srt_path)
+        shutil.copyfile(srt_or_ass_path.replace(r"\:", ":"), temp_sub_path)
 
         font_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../font"))
         os.makedirs(font_dir, exist_ok=True)
 
-        # Default style (only used if subtitle_filter not provided)
-        default_style = (
-            "FontName=SimHei,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-            "Outline=2,Shadow=0,BorderStyle=1,Alignment=2,WrapStyle=2,LineSpacing=1,MarginV=60,MarginL=60,MarginR=60"
-        )
+        # If no external filter provided, construct a basic one.
         filter_option = subtitle_filter or (
-            f"subtitles='{_escape_for_ass(temp_srt_path)}':charenc=UTF-8:"
-            f"fontsdir='{_escape_for_ass(font_dir)}':"
-            f"force_style='{default_style}'"
+            f"subtitles='{_escape_for_ass(temp_sub_path)}':fontsdir='{_escape_for_ass(font_dir)}'"
         )
 
         command = [
@@ -502,7 +553,7 @@ def add_subtitles(video_path, srt_path, output_path, subtitle_filter=None, metho
         logger.error(f"Subtitle add failed: {e}")
         return False
     finally:
-        for p in [locals().get('temp_video_path'), locals().get('temp_srt_path'), locals().get('temp_output_path')]:
+        for p in [locals().get('temp_video_path'), locals().get('temp_sub_path'), locals().get('temp_output_path')]:
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
