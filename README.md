@@ -79,8 +79,14 @@ pip install -r requirements_module.txt
 
 Before running the program, you need to configure the necessary environment variables. In the root directory of the project, create a `.env` file by renaming `env.example` and filling in the following variables:
 
+We are currently using Higgs Audio Model from BosonAI. You may change this model to other audio models that are capable of ASR or TTS. 
+Note that TTS can be done by the local model with the option XTTS.
+
 - `BOSON_API_KEY`: Your Boson API key.
 
+You would also need to fill in the key for the QWEN model we are using for translation. You may change this model if you want.
+
+Currently the API Key for Qwen model is also under BOSON_API_KEY, but you may add another API Key and link to it.
 
 
 ### 4. Run the Application
@@ -90,6 +96,7 @@ Before launching the application, run the following commands to automatically do
 ```bash
 # For Linux
 bash scripts/download_models.sh
+```
 
 Once the download is complete, launch the WebUI interface using the following command:
 
